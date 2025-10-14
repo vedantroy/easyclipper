@@ -1,6 +1,30 @@
 import { useState, useRef } from 'react'
 import { transcribe, canUseWhisperWeb, resampleTo16Khz, downloadWhisperModel, toCaptions } from '@remotion/whisper-web'
+import ReactSlider from 'react-slider'
+import { useDropzone } from 'react-dropzone'
+import localforage from 'localforage'
 import './App.css'
+
+// Cache storage interface
+interface CachedTranscript {
+  hash: string
+  fileName: string
+  fileSize: number
+  processedAt: string
+  numChunks: number
+  chunkingEnabled: boolean
+  modelUsed: string
+  captions: Array<{text: string, startMs: number, endMs: number, confidence: number | null}>
+}
+
+// Generate SHA-256 hash of file content
+async function hashFile(file: File): Promise<string> {
+  const arrayBuffer = await file.arrayBuffer()
+  const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer)
+  const hashArray = Array.from(new Uint8Array(hashBuffer))
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+  return hashHex
+}
 
 function App() {
   const [status, setStatus] = useState<string>('Ready to transcribe')
@@ -15,9 +39,14 @@ function App() {
   const [currentTime, setCurrentTime] = useState(0)
   const [captionsData, setCaptionsData] = useState<Array<{text: string, startMs: number, endMs: number, confidence: number | null}>>([])
   const [activeCaptionIndex, setActiveCaptionIndex] = useState<number>(-1)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [selectionMode, setSelectionMode] = useState(false)
+  const [selectedRange, setSelectedRange] = useState<{start: number, end: number} | null>(null)
+  const [subclipUrl, setSubclipUrl] = useState<string>('')
+  const [trimValues, setTrimValues] = useState<[number, number]>([0, 100])
+  const [subclipDuration, setSubclipDuration] = useState<number>(0)
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
+  const subclipAudioRef = useRef<HTMLAudioElement>(null)
 
   const initAudioContext = () => {
     if (!audioContextRef.current) {
@@ -125,6 +154,97 @@ function App() {
     }
   }
 
+  const handleCaptionClick = async (index: number) => {
+    if (!selectionMode) {
+      // First click - enter selection mode
+      setSelectionMode(true)
+      setSelectedRange({ start: index, end: index })
+    } else {
+      // Second click - complete selection
+      const startIdx = Math.min(selectedRange!.start, index)
+      const endIdx = Math.max(selectedRange!.start, index)
+
+      setSelectedRange({ start: startIdx, end: endIdx })
+
+      // Create subclip
+      if (audioBuffer) {
+        const startMs = captionsData[startIdx].startMs
+        const endMs = captionsData[endIdx].endMs
+
+        const startTime = startMs / 1000
+        const endTime = endMs / 1000
+
+        const duration = endTime - startTime
+        setSubclipDuration(duration)
+        setTrimValues([0, 100]) // Reset trim values
+
+        const trimmedBuffer = trimAudioBuffer(audioBuffer, startTime, endTime)
+        const wavBlob = await audioBufferToWav(trimmedBuffer)
+        const url = URL.createObjectURL(wavBlob)
+
+        // Clean up old URL if exists
+        if (subclipUrl) {
+          URL.revokeObjectURL(subclipUrl)
+        }
+
+        setSubclipUrl(url)
+      }
+    }
+  }
+
+  const handleTrimChange = async (values: [number, number]) => {
+    setTrimValues(values)
+
+    if (!audioBuffer || !selectedRange) return
+
+    const startMs = captionsData[selectedRange.start].startMs
+    const endMs = captionsData[selectedRange.end].endMs
+
+    const originalStartTime = startMs / 1000
+    const originalEndTime = endMs / 1000
+    const originalDuration = originalEndTime - originalStartTime
+
+    // Calculate trimmed times based on percentage
+    const trimStartOffset = (values[0] / 100) * originalDuration
+    const trimEndOffset = (values[1] / 100) * originalDuration
+
+    const trimmedStartTime = originalStartTime + trimStartOffset
+    const trimmedEndTime = originalStartTime + trimEndOffset
+
+    const trimmedBuffer = trimAudioBuffer(audioBuffer, trimmedStartTime, trimmedEndTime)
+    const wavBlob = await audioBufferToWav(trimmedBuffer)
+    const url = URL.createObjectURL(wavBlob)
+
+    // Clean up old URL if exists
+    if (subclipUrl) {
+      URL.revokeObjectURL(subclipUrl)
+    }
+
+    setSubclipUrl(url)
+  }
+
+  const clearSelection = () => {
+    setSelectionMode(false)
+    setSelectedRange(null)
+    if (subclipUrl) {
+      URL.revokeObjectURL(subclipUrl)
+      setSubclipUrl('')
+    }
+  }
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop: (acceptedFiles) => {
+      const file = acceptedFiles[0]
+      if (file) {
+        processFile(file)
+      }
+    },
+    accept: {
+      'audio/*': []
+    },
+    multiple: false
+  })
+
   const chunkAudioFile = async (file: File, numChunks: number): Promise<File[]> => {
     let buffer = audioBuffer
     if (!buffer) {
@@ -150,10 +270,7 @@ function App() {
     return chunks
   }
 
-  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    if (!file) return
-
+  const processFile = async (file: File) => {
     setIsProcessing(true)
     setTranscription('')
     setCaptionsData([])
@@ -162,7 +279,7 @@ function App() {
     // Create URL for audio playback
     const url = URL.createObjectURL(file)
     setAudioUrl(url)
-    
+
     console.log('File info:', {
       name: file.name,
       size: file.size,
@@ -170,8 +287,44 @@ function App() {
       duration: 'unknown', // Will be calculated during processing
       sizeInMB: (file.size / 1024 / 1024).toFixed(2) + ' MB'
     })
-    
+
     try {
+      // Generate hash and check cache
+      setStatus('Checking cache...')
+      const fileHash = await hashFile(file)
+      const cached = await localforage.getItem<CachedTranscript>(fileHash)
+
+      if (cached) {
+        // Found in cache - ask user
+        const useCache = window.confirm(
+          `This file was processed before (${cached.processedAt}).\n` +
+          `Load from cache? (${cached.captions.length} captions, ${cached.numChunks} chunks)`
+        )
+
+        if (useCache) {
+          setStatus('Loading from cache...')
+          setCaptionsData(cached.captions)
+
+          // Generate transcription text for display
+          const transcriptionText = cached.captions.map(caption => {
+            const formatTime = (ms: number) => {
+              const hours = Math.floor(ms / 3600000)
+              const minutes = Math.floor((ms % 3600000) / 60000)
+              const seconds = Math.floor((ms % 60000) / 1000)
+              const milliseconds = ms % 1000
+              return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')},${milliseconds.toString().padStart(3, '0')}`
+            }
+            return `[${formatTime(caption.startMs)} --> ${formatTime(caption.endMs)}] ${caption.text} (confidence: ${caption.confidence?.toFixed(3) ?? 'N/A'})`
+          }).join('\n')
+
+          setTranscription(transcriptionText)
+          setStatus('Loaded from cache!')
+          setIsProcessing(false)
+          return
+        }
+      }
+
+      // Continue with normal processing
       const modelToUse = 'tiny.en'
       
       setStatus('Checking browser compatibility...')
@@ -312,8 +465,25 @@ function App() {
       const finalTranscription = allTranscriptions.join('\n\n')
       setTranscription(finalTranscription)
       setCaptionsData(allCaptions)
+
+      // Save to cache
+      setStatus('Saving to cache...')
+      const cacheData: CachedTranscript = {
+        hash: fileHash,
+        fileName: file.name,
+        fileSize: file.size,
+        processedAt: new Date().toLocaleString(),
+        numChunks: useChunking ? numChunks : 1,
+        chunkingEnabled: useChunking,
+        modelUsed: modelToUse,
+        captions: allCaptions
+      }
+
+      await localforage.setItem(fileHash, cacheData)
+      console.log('Saved to cache with hash:', fileHash)
+
       setStatus('Transcription complete!')
-      
+
     } catch (error) {
       console.error('Error transcribing:', error)
       setStatus(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
@@ -324,34 +494,48 @@ function App() {
 
   return (
     <>
-      <div style={{ 
-        padding: '2rem', 
-        maxWidth: '800px', 
+      <div style={{
+        padding: '2rem',
+        maxWidth: '1200px',
+        width: 'min(100vw - 4rem, 1200px)',
         margin: '0 auto',
         color: '#333',
         backgroundColor: '#fff',
         minHeight: '100vh'
       }}>
-        <h1 style={{ color: '#333', marginBottom: '2rem' }}>Audio Transcription with Whisper</h1>
-        
-        <div style={{ marginBottom: '2rem' }}>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="audio/*"
-            onChange={handleFileSelect}
-            disabled={isProcessing}
-            style={{ 
-              marginBottom: '1rem', 
-              display: 'block',
-              padding: '0.5rem',
-              fontSize: '1rem',
-              border: '1px solid #ccc',
-              borderRadius: '4px'
-            }}
-          />
 
-          <div style={{ marginBottom: '1rem', padding: '1rem', border: '1px solid #ddd', borderRadius: '4px', backgroundColor: '#f9f9f9' }}>
+        <div style={{ marginBottom: '2rem' }}>
+          <div
+            {...getRootProps()}
+            style={{
+              border: `2px dashed ${isDragActive ? '#4caf50' : '#ccc'}`,
+              borderRadius: '8px',
+              padding: '2rem',
+              textAlign: 'center',
+              cursor: isProcessing ? 'not-allowed' : 'pointer',
+              backgroundColor: isDragActive ? '#f0f8f0' : '#fafafa',
+              transition: 'all 0.3s ease',
+              opacity: isProcessing ? 0.6 : 1
+            }}
+          >
+            <input {...getInputProps()} disabled={isProcessing} />
+            {isDragActive ? (
+              <p style={{ color: '#4caf50', margin: 0, fontSize: '1.1em' }}>
+                Drop the audio file here...
+              </p>
+            ) : (
+              <div>
+                <p style={{ color: '#666', margin: '0 0 0.5rem 0', fontSize: '1.1em' }}>
+                  Drag & drop an audio file here, or click to select
+                </p>
+                <p style={{ color: '#999', margin: 0, fontSize: '0.9em' }}>
+                  Supports MP3, WAV, M4A, and other audio formats
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div style={{ marginTop: '3rem', marginBottom: '1rem', padding: '1rem', border: '1px solid #ddd', borderRadius: '4px' }}>
             <label style={{ display: 'flex', alignItems: 'center', marginBottom: '0.5rem', color: '#333' }}>
               <input
                 type="checkbox"
@@ -457,6 +641,34 @@ function App() {
             marginBottom: '2rem'
           }}>
             <h3 style={{ color: '#333', marginTop: 0, marginBottom: '1rem' }}>Captions (Synced with Audio)</h3>
+            {selectionMode && (
+              <div style={{
+                marginBottom: '1rem',
+                padding: '0.5rem',
+                backgroundColor: '#fffacd',
+                borderRadius: '4px',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center'
+              }}>
+                <span style={{ color: '#666' }}>
+                  Selection mode active - click another caption to select range
+                </span>
+                <button
+                  onClick={clearSelection}
+                  style={{
+                    padding: '0.25rem 0.5rem',
+                    backgroundColor: '#dc3545',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '3px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Clear Selection
+                </button>
+              </div>
+            )}
             <p style={{
               lineHeight: '1.8',
               fontSize: '1.1em',
@@ -465,19 +677,26 @@ function App() {
             }}>
               {captionsData.map((caption, index) => {
                 const isActive = index === activeCaptionIndex
+                const isSelected = selectedRange && index >= selectedRange.start && index <= selectedRange.end
+                const isSelectionStart = selectedRange && index === selectedRange.start
+                const isSelectionEnd = selectedRange && index === selectedRange.end
 
                 return (
                   <span
                     key={index}
+                    onClick={() => handleCaptionClick(index)}
                     style={{
-                      padding: isActive ? '2px 4px' : '0',
-                      backgroundColor: isActive ? '#ffd700' : 'transparent',
-                      borderRadius: isActive ? '3px' : '0',
+                      padding: isActive || isSelected ? '2px 4px' : '0',
+                      backgroundColor: isSelected ? '#90EE90' : (isActive ? '#ffd700' : 'transparent'),
+                      borderRadius: (isActive || isSelected) ? '3px' : '0',
                       transition: 'all 0.3s ease',
-                      color: isActive ? '#000' : '#333',
-                      fontWeight: isActive ? 'bold' : 'normal',
+                      color: (isActive || isSelected) ? '#000' : '#333',
+                      fontWeight: (isActive || isSelected) ? 'bold' : 'normal',
                       borderBottom: '1px solid #e0e0e0',
-                      boxShadow: isActive ? '0 2px 4px rgba(255, 215, 0, 0.3)' : 'none'
+                      boxShadow: isActive ? '0 2px 4px rgba(255, 215, 0, 0.3)' : (isSelected ? '0 2px 4px rgba(144, 238, 144, 0.3)' : 'none'),
+                      cursor: 'pointer',
+                      userSelect: 'none',
+                      border: isSelectionStart ? '2px solid green' : (isSelectionEnd ? '2px solid red' : 'none')
                     }}
                   >
                     {caption.text}
@@ -488,6 +707,94 @@ function App() {
                 return [...acc, ' ', curr]
               }, [])}
             </p>
+          </div>
+        )}
+
+        {subclipUrl && (
+          <div style={{
+            marginTop: '2rem',
+            padding: '1rem',
+            backgroundColor: '#e8f5e9',
+            border: '2px solid #4caf50',
+            borderRadius: '4px',
+            position: 'sticky',
+            bottom: '20px'
+          }}>
+            <h3 style={{ color: '#2e7d32', marginTop: 0, marginBottom: '1rem' }}>Audio Subclip</h3>
+            {selectedRange && (
+              <p style={{ color: '#666', fontSize: '0.9em', marginBottom: '1rem' }}>
+                Selected range: Caption {selectedRange.start + 1} to {selectedRange.end + 1}
+                ({((captionsData[selectedRange.end].endMs - captionsData[selectedRange.start].startMs) / 1000).toFixed(2)}s)
+              </p>
+            )}
+            <audio
+              ref={subclipAudioRef}
+              controls
+              src={subclipUrl}
+              style={{ width: '100%', marginBottom: '1rem' }}
+            />
+
+            {/* Trim controls */}
+            <div style={{ marginBottom: '1rem', padding: '0.5rem', backgroundColor: '#fff', borderRadius: '4px' }}>
+              <p style={{ color: '#666', fontSize: '0.9em', marginBottom: '0.5rem' }}>
+                Trim: {((trimValues[0] / 100) * subclipDuration).toFixed(2)}s - {((trimValues[1] / 100) * subclipDuration).toFixed(2)}s
+                (Duration: {(((trimValues[1] - trimValues[0]) / 100) * subclipDuration).toFixed(2)}s)
+              </p>
+              <ReactSlider
+                className="horizontal-slider"
+                thumbClassName="thumb"
+                trackClassName="track"
+                value={trimValues}
+                onChange={(value) => handleTrimChange(value as [number, number])}
+                min={0}
+                max={100}
+                minDistance={5}
+                renderThumb={(props) => (
+                  <div
+                    {...props}
+                    style={{
+                      ...props.style,
+                      height: '20px',
+                      width: '20px',
+                      borderRadius: '50%',
+                      backgroundColor: '#4caf50',
+                      border: '2px solid #fff',
+                      boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      cursor: 'grab'
+                    }}
+                  />
+                )}
+                renderTrack={(props, state) => (
+                  <div
+                    {...props}
+                    style={{
+                      ...props.style,
+                      height: '6px',
+                      borderRadius: '3px',
+                      backgroundColor: state.index === 1 ? '#4caf50' : '#ddd'
+                    }}
+                  />
+                )}
+              />
+            </div>
+
+            <button
+              onClick={clearSelection}
+              style={{
+                padding: '0.5rem 1rem',
+                backgroundColor: '#f44336',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                width: '100%'
+              }}
+            >
+              Clear Subclip
+            </button>
           </div>
         )}
 
