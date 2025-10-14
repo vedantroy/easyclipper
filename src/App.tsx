@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react'
-import { transcribe, canUseWhisperWeb, resampleTo16Khz, downloadWhisperModel } from '@remotion/whisper-web'
+import { transcribe, canUseWhisperWeb, resampleTo16Khz, downloadWhisperModel, toCaptions } from '@remotion/whisper-web'
 import './App.css'
 
 function App() {
@@ -9,8 +9,15 @@ function App() {
   const [useChunking, setUseChunking] = useState(false)
   const [numChunks, setNumChunks] = useState(4)
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null)
+  const [debugMode, setDebugMode] = useState(false)
+  const [debugChunks, setDebugChunks] = useState(1)
+  const [audioUrl, setAudioUrl] = useState<string>('')
+  const [currentTime, setCurrentTime] = useState(0)
+  const [captionsData, setCaptionsData] = useState<Array<{text: string, startMs: number, endMs: number, confidence: number | null}>>([])
+  const [activeCaptionIndex, setActiveCaptionIndex] = useState<number>(-1)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
+  const audioRef = useRef<HTMLAudioElement>(null)
 
   const initAudioContext = () => {
     if (!audioContextRef.current) {
@@ -102,6 +109,22 @@ function App() {
     return new Blob([arrayBuffer], { type: 'audio/wav' })
   }
 
+  const handleTimeUpdate = () => {
+    if (!audioRef.current) return
+
+    const currentTimeMs = audioRef.current.currentTime * 1000
+    setCurrentTime(currentTimeMs)
+
+    // Find the active caption
+    const activeIndex = captionsData.findIndex(caption =>
+      currentTimeMs >= caption.startMs && currentTimeMs <= caption.endMs
+    )
+
+    if (activeIndex !== activeCaptionIndex) {
+      setActiveCaptionIndex(activeIndex)
+    }
+  }
+
   const chunkAudioFile = async (file: File, numChunks: number): Promise<File[]> => {
     let buffer = audioBuffer
     if (!buffer) {
@@ -133,6 +156,12 @@ function App() {
 
     setIsProcessing(true)
     setTranscription('')
+    setCaptionsData([])
+    setActiveCaptionIndex(-1)
+
+    // Create URL for audio playback
+    const url = URL.createObjectURL(file)
+    setAudioUrl(url)
     
     console.log('File info:', {
       name: file.name,
@@ -186,8 +215,12 @@ function App() {
       }
 
       const allTranscriptions: string[] = []
+      const allCaptions: Array<{text: string, startMs: number, endMs: number, confidence: number | null}> = []
 
-      for (let i = 0; i < filesToTranscribe.length; i++) {
+      // In debug mode with chunking, only process the specified number of chunks
+      const chunksToProcess = (debugMode && useChunking) ? Math.min(debugChunks, filesToTranscribe.length) : filesToTranscribe.length
+
+      for (let i = 0; i < chunksToProcess; i++) {
         const currentFile = filesToTranscribe[i]
         const chunkLabel = useChunking ? ` (chunk ${i + 1}/${numChunks})` : ''
 
@@ -201,41 +234,84 @@ function App() {
 
         setStatus(`Transcribing${chunkLabel}...`)
         console.log(`Starting transcribe step${chunkLabel}`)
-        const { transcription: result } = await transcribe({
+        const whisperWebOutput = await transcribe({
           channelWaveform,
           model: modelToUse,
           onProgress: (progress) => setStatus(`Transcribing${chunkLabel} (${Math.round(progress * 100)}%)...`),
         })
         console.log(`Transcribe complete${chunkLabel}`)
-        console.log('Raw transcription result:', result)
+
+        // Convert to captions format
+        const { captions } = toCaptions({
+          whisperWebOutput,
+        })
+        console.log('Captions:', captions)
 
         if (useChunking && loadedBuffer) {
           const chunkStartTime = i * (loadedBuffer.length / loadedBuffer.sampleRate / numChunks)
-          const chunkTranscriptionWithTimestamps = result.map(segment => {
-            // Calculate absolute timestamp by adding chunk start time to segment timestamp
-            const segmentStartMs = segment.offsets.from + (chunkStartTime * 1000)
-            const hours = Math.floor(segmentStartMs / 3600000)
-            const minutes = Math.floor((segmentStartMs % 3600000) / 60000)
-            const seconds = Math.floor((segmentStartMs % 60000) / 1000)
-            const ms = segmentStartMs % 1000
-            
-            const timestamp = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`
-            return `[${timestamp}] ${segment.text}`
+
+          // Add adjusted captions to the global list, filtering out empty duration captions
+          captions.forEach(caption => {
+            if (caption.startMs !== caption.endMs) {
+              allCaptions.push({
+                text: caption.text,
+                startMs: caption.startMs + (chunkStartTime * 1000),
+                endMs: caption.endMs + (chunkStartTime * 1000),
+                confidence: caption.confidence
+              })
+            }
+          })
+
+          const chunkTranscriptionWithTimestamps = captions.map(caption => {
+            // Calculate absolute timestamp by adding chunk start time to caption timestamp
+            const absoluteStartMs = caption.startMs + (chunkStartTime * 1000)
+            const absoluteEndMs = caption.endMs + (chunkStartTime * 1000)
+
+            const formatTime = (ms: number) => {
+              const hours = Math.floor(ms / 3600000)
+              const minutes = Math.floor((ms % 3600000) / 60000)
+              const seconds = Math.floor((ms % 60000) / 1000)
+              const milliseconds = ms % 1000
+              return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')},${milliseconds.toString().padStart(3, '0')}`
+            }
+
+            return `[${formatTime(absoluteStartMs)} --> ${formatTime(absoluteEndMs)}] ${caption.text} (confidence: ${caption.confidence?.toFixed(3) ?? 'N/A'})`
           }).join('\n')
-          
+
           allTranscriptions.push(chunkTranscriptionWithTimestamps)
         } else {
-          // For non-chunked transcription, use the original timestamps
-          const transcriptionWithTimestamps = result.map(segment => {
-            return `[${segment.timestamps.from}] ${segment.text}`
+          // Add all captions to the global list, filtering out empty duration captions
+          captions.forEach(caption => {
+            if (caption.startMs !== caption.endMs) {
+              allCaptions.push({
+                text: caption.text,
+                startMs: caption.startMs,
+                endMs: caption.endMs,
+                confidence: caption.confidence
+              })
+            }
+          })
+
+          // For non-chunked transcription, display captions with their timestamps
+          const transcriptionWithTimestamps = captions.map(caption => {
+            const formatTime = (ms: number) => {
+              const hours = Math.floor(ms / 3600000)
+              const minutes = Math.floor((ms % 3600000) / 60000)
+              const seconds = Math.floor((ms % 60000) / 1000)
+              const milliseconds = ms % 1000
+              return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')},${milliseconds.toString().padStart(3, '0')}`
+            }
+
+            return `[${formatTime(caption.startMs)} --> ${formatTime(caption.endMs)}] ${caption.text} (confidence: ${caption.confidence?.toFixed(3) ?? 'N/A'})`
           }).join('\n')
-          
+
           allTranscriptions.push(transcriptionWithTimestamps)
         }
       }
 
       const finalTranscription = allTranscriptions.join('\n\n')
       setTranscription(finalTranscription)
+      setCaptionsData(allCaptions)
       setStatus('Transcription complete!')
       
     } catch (error) {
@@ -286,7 +362,7 @@ function App() {
               />
               Enable chunking for long files (Web Audio API)
             </label>
-            
+
             {useChunking && (
               <div style={{ marginLeft: '1.5rem' }}>
                 <label style={{ color: '#333', display: 'block', marginBottom: '0.25rem' }}>
@@ -304,6 +380,37 @@ function App() {
                 <div style={{ fontSize: '0.85em', color: '#666', marginTop: '0.25rem' }}>
                   Each chunk will be ~{Math.round(100/numChunks)}% of the file
                 </div>
+
+                <label style={{ display: 'flex', alignItems: 'center', marginTop: '0.75rem', color: '#333' }}>
+                  <input
+                    type="checkbox"
+                    checked={debugMode}
+                    onChange={(e) => setDebugMode(e.target.checked)}
+                    disabled={isProcessing}
+                    style={{ marginRight: '0.5rem' }}
+                  />
+                  Debug mode (limit chunks to transcribe)
+                </label>
+
+                {debugMode && (
+                  <div style={{ marginLeft: '1.5rem', marginTop: '0.5rem' }}>
+                    <label style={{ color: '#333', display: 'block', marginBottom: '0.25rem' }}>
+                      Chunks to transcribe: {debugChunks}
+                    </label>
+                    <input
+                      type="range"
+                      min="1"
+                      max={Math.min(numChunks, 5)}
+                      value={debugChunks}
+                      onChange={(e) => setDebugChunks(Number(e.target.value))}
+                      disabled={isProcessing}
+                      style={{ width: '100%' }}
+                    />
+                    <div style={{ fontSize: '0.85em', color: '#666', marginTop: '0.25rem' }}>
+                      Will transcribe {debugChunks} of {numChunks} chunks
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -320,20 +427,70 @@ function App() {
           </div>
         </div>
 
-        {transcription && (
+        {audioUrl && (
+          <div style={{
+            marginBottom: '2rem',
+            padding: '1rem',
+            backgroundColor: '#f8f9fa',
+            border: '1px solid #dee2e6',
+            borderRadius: '4px'
+          }}>
+            <h3 style={{ color: '#333', marginTop: 0, marginBottom: '1rem' }}>Audio Playback</h3>
+            <audio
+              ref={audioRef}
+              controls
+              src={audioUrl}
+              onTimeUpdate={handleTimeUpdate}
+              style={{ width: '100%' }}
+            />
+          </div>
+        )}
+
+        {captionsData.length > 0 && (
           <div style={{
             padding: '1rem',
             backgroundColor: '#f8f9fa',
             border: '1px solid #dee2e6',
             borderRadius: '4px',
-            whiteSpace: 'pre-wrap',
-            color: '#333',
-            textAlign: 'left'
+            maxHeight: '400px',
+            overflowY: 'auto',
+            marginBottom: '2rem'
           }}>
-            <h3 style={{ color: '#333', marginTop: 0 }}>Transcription:</h3>
-            <p style={{ color: '#333', margin: 0 }}>{transcription}</p>
+            <h3 style={{ color: '#333', marginTop: 0, marginBottom: '1rem' }}>Captions (Synced with Audio)</h3>
+            <p style={{
+              lineHeight: '1.8',
+              fontSize: '1.1em',
+              color: '#333',
+              margin: 0
+            }}>
+              {captionsData.map((caption, index) => {
+                const isActive = index === activeCaptionIndex
+
+                return (
+                  <span
+                    key={index}
+                    style={{
+                      padding: isActive ? '2px 4px' : '0',
+                      backgroundColor: isActive ? '#ffd700' : 'transparent',
+                      borderRadius: isActive ? '3px' : '0',
+                      transition: 'all 0.3s ease',
+                      color: isActive ? '#000' : '#333',
+                      fontWeight: isActive ? 'bold' : 'normal',
+                      borderBottom: '1px solid #e0e0e0',
+                      boxShadow: isActive ? '0 2px 4px rgba(255, 215, 0, 0.3)' : 'none'
+                    }}
+                  >
+                    {caption.text}
+                  </span>
+                )
+              }).reduce<React.ReactNode[]>((acc, curr, index) => {
+                if (index === 0) return [curr]
+                return [...acc, ' ', curr]
+              }, [])}
+            </p>
           </div>
         )}
+
       </div>
     </>
   )
