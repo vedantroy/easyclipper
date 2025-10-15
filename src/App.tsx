@@ -49,24 +49,98 @@ function formatTime(seconds: number): string {
 // Group consecutive words into chunks so each chunk becomes ONE virtual row.
 function chunkCaptions(
   caps: Caption[],
-  maxWords = 80,
+  maxChars = 400,
   maxGapMs = 900
 ) {
   const chunks: { start: number; end: number; startMs: number; endMs: number }[] = []
   if (!caps.length) return chunks
+
   let start = 0
-  for (let i = 1; i < caps.length; i++) {
-    const tooMany = i - start >= maxWords
-    const gap = caps[i].startMs - caps[i - 1].endMs
-    if (tooMany || gap > maxGapMs) {
+  let charCount = 0
+
+  for (let i = 0; i < caps.length; i++) {
+    const wordLength = caps[i].text.length
+    const spaceNeeded = i > start ? 1 : 0 // space before word (except first)
+    const totalNeeded = charCount + spaceNeeded + wordLength
+
+    // Check if we should break the chunk
+    const tooLong = totalNeeded > maxChars && i > start // Don't break on first word
+    const hasGap = i > 0 && (caps[i].startMs - caps[i - 1].endMs) > maxGapMs
+
+    if (tooLong || hasGap) {
+      // End current chunk at previous word
       chunks.push({
-        start, end: i - 1,
-        startMs: caps[start].startMs, endMs: caps[i - 1].endMs
+        start,
+        end: i - 1,
+        startMs: caps[start].startMs,
+        endMs: caps[i - 1].endMs
       })
       start = i
+      charCount = wordLength
+    } else {
+      charCount = totalNeeded
     }
   }
-  chunks.push({ start, end: caps.length - 1, startMs: caps[start].startMs, endMs: caps[caps.length - 1].endMs })
+
+  // Add final chunk
+  if (start < caps.length) {
+    chunks.push({
+      start,
+      end: caps.length - 1,
+      startMs: caps[start].startMs,
+      endMs: caps[caps.length - 1].endMs
+    })
+  }
+
+  return chunks
+}
+
+// Simple chunking that splits on periods (sentences)
+function chunkCaptionsSimple(
+  caps: Caption[],
+  minChars = 400,
+  maxChars = 600
+) {
+  const chunks: { start: number; end: number; startMs: number; endMs: number }[] = []
+  if (!caps.length) return chunks
+
+  let start = 0
+  let charCount = 0
+
+  for (let i = 0; i < caps.length; i++) {
+    const word = caps[i].text
+    const wordLength = word.length
+    const spaceNeeded = i > start ? 1 : 0
+    charCount += spaceNeeded + wordLength
+
+    // Check if this word ends with a period and we have enough chars
+    const endsWithPeriod = word.endsWith('.') || word === '.'
+    const hasEnoughChars = charCount >= minChars
+    const tooManyChars = charCount >= maxChars
+
+    if ((endsWithPeriod && hasEnoughChars) || tooManyChars) {
+      // End chunk here
+      chunks.push({
+        start,
+        end: i,
+        startMs: caps[start].startMs,
+        endMs: caps[i].endMs
+      })
+      start = i + 1
+      charCount = 0
+    }
+  }
+
+  // Add remaining words as final chunk
+  if (start < caps.length) {
+    chunks.push({
+      start,
+      end: caps.length - 1,
+      startMs: caps[start].startMs,
+      endMs: caps[caps.length - 1].endMs
+    })
+  }
+
   return chunks
 }
 
@@ -98,7 +172,7 @@ function App() {
 
   // Build chunks for virtualization (one chunk = one row).
   const { chunks, wordToChunk } = useMemo(() => {
-    const cs = chunkCaptions(captionsData, 80, 900)
+    const cs = chunkCaptionsSimple(captionsData, 400, 1200) // Use sentence-based chunking
     const map: number[] = new Array(captionsData.length)
     cs.forEach((c, idx) => { for (let i = c.start; i <= c.end; i++) map[i] = idx })
     return { chunks: cs, wordToChunk: map }
@@ -868,6 +942,7 @@ function App() {
                         color: '#333',
                         whiteSpace: 'normal',
                         wordBreak: 'break-word',
+                        textAlign: 'left',
                       }}
                     >
                       {slice.map((c, i) => {
