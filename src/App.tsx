@@ -26,6 +26,21 @@ async function hashFile(file: File): Promise<string> {
   return hashHex
 }
 
+// Format time in seconds to human readable
+function formatTime(seconds: number): string {
+  if (seconds < 60) {
+    return `${Math.round(seconds)}s`
+  } else if (seconds < 3600) {
+    const mins = Math.floor(seconds / 60)
+    const secs = Math.round(seconds % 60)
+    return `${mins}m ${secs}s`
+  } else {
+    const hours = Math.floor(seconds / 3600)
+    const mins = Math.floor((seconds % 3600) / 60)
+    return `${hours}h ${mins}m`
+  }
+}
+
 function App() {
   const [status, setStatus] = useState<string>('Ready to transcribe')
   const [transcription, setTranscription] = useState<string>('')
@@ -44,9 +59,31 @@ function App() {
   const [subclipUrl, setSubclipUrl] = useState<string>('')
   const [trimValues, setTrimValues] = useState<[number, number]>([0, 100])
   const [subclipDuration, setSubclipDuration] = useState<number>(0)
+  const [progress, setProgress] = useState<number>(0)
+  const [estimatedTimeRemaining, setEstimatedTimeRemaining] = useState<string>('')
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
   const subclipAudioRef = useRef<HTMLAudioElement>(null)
+  const startTimeRef = useRef<number>(0)
+
+  // Simple, phase-aware progress + ETA (no 10/90 guessing)
+  const NUM_PHASES = 2 // 0: resample, 1: transcribe
+  const updateOverall = (chunkIndex: number, phaseIndex: number, phaseProgress: number, chunksTotal: number) => {
+    const completedUnits = (chunkIndex * NUM_PHASES) + phaseIndex + Math.max(0, Math.min(1, phaseProgress))
+    const totalUnits = chunksTotal * NUM_PHASES
+    const overall = (completedUnits / totalUnits) * 100
+    const clamped = Math.max(0, Math.min(100, overall))
+    setProgress(clamped)
+    // ETA after 1% to avoid wild swings
+    if (clamped >= 1) {
+      const elapsed = (Date.now() - startTimeRef.current) / 1000
+      const frac = clamped / 100
+      if (frac > 0) {
+        const remaining = elapsed * (1 - frac) / frac
+        setEstimatedTimeRemaining(formatTime(remaining))
+      }
+    }
+  }
 
   const initAudioContext = () => {
     if (!audioContextRef.current) {
@@ -275,6 +312,9 @@ function App() {
     setTranscription('')
     setCaptionsData([])
     setActiveCaptionIndex(-1)
+    setProgress(0)
+    startTimeRef.current = Date.now()
+    setEstimatedTimeRemaining('')
 
     // Create URL for audio playback
     const url = URL.createObjectURL(file)
@@ -291,10 +331,23 @@ function App() {
     try {
       // Generate hash and check cache
       setStatus('Checking cache...')
+      console.log('Starting cache check for file:', file.name, 'size:', file.size)
+
       const fileHash = await hashFile(file)
+      console.log('Generated file hash:', fileHash)
+
       const cached = await localforage.getItem<CachedTranscript>(fileHash)
+      console.log('Cache lookup result:', cached ? 'FOUND' : 'NOT FOUND')
 
       if (cached) {
+        console.log('Cache data:', {
+          fileName: cached.fileName,
+          fileSize: cached.fileSize,
+          captionsCount: cached.captions.length,
+          numChunks: cached.numChunks,
+          processedAt: cached.processedAt
+        })
+
         // Found in cache - ask user
         const useCache = window.confirm(
           `This file was processed before (${cached.processedAt}).\n` +
@@ -302,11 +355,24 @@ function App() {
         )
 
         if (useCache) {
+          console.log('User chose to load from cache, starting cache load...')
           setStatus('Loading from cache...')
+
+          console.log('Setting captions data, count:', cached.captions.length)
           setCaptionsData(cached.captions)
 
+          // Load audio buffer for sub-clipping functionality
+          console.log('Loading audio buffer for sub-clipping...')
+          const buffer = await loadAudioBuffer(file)
+          setAudioBuffer(buffer)
+          console.log('Audio buffer loaded')
+
+          console.log('Generating transcription text...')
           // Generate transcription text for display
-          const transcriptionText = cached.captions.map(caption => {
+          const transcriptionText = cached.captions.map((caption, index) => {
+            if (index % 100 === 0) {
+              console.log(`Processing caption ${index + 1}/${cached.captions.length}`)
+            }
             const formatTime = (ms: number) => {
               const hours = Math.floor(ms / 3600000)
               const minutes = Math.floor((ms % 3600000) / 60000)
@@ -317,11 +383,17 @@ function App() {
             return `[${formatTime(caption.startMs)} --> ${formatTime(caption.endMs)}] ${caption.text} (confidence: ${caption.confidence?.toFixed(3) ?? 'N/A'})`
           }).join('\n')
 
+          console.log('Setting transcription text, length:', transcriptionText.length)
           setTranscription(transcriptionText)
           setStatus('Loaded from cache!')
           setIsProcessing(false)
+          console.log('Cache load complete!')
           return
+        } else {
+          console.log('User chose not to use cache, proceeding with normal processing')
         }
+      } else {
+        console.log('No cache entry found, proceeding with normal processing')
       }
 
       // Continue with normal processing
@@ -375,13 +447,16 @@ function App() {
 
       for (let i = 0; i < chunksToProcess; i++) {
         const currentFile = filesToTranscribe[i]
-        const chunkLabel = useChunking ? ` (chunk ${i + 1}/${numChunks})` : ''
+        const chunkLabel = useChunking ? ` (chunk ${i + 1}/${chunksToProcess})` : ''
 
         setStatus(`Resampling audio${chunkLabel}...`)
         console.log(`Starting resample step${chunkLabel}`)
         const channelWaveform = await resampleTo16Khz({
           file: currentFile,
-          onProgress: (progress) => setStatus(`Resampling audio${chunkLabel} (${Math.round(progress * 100)}%)...`),
+          onProgress: (p) => {
+            updateOverall(i, 0, p, chunksToProcess)
+            setStatus(`Resampling audio${chunkLabel} (${Math.round(p * 100)}%)...`)
+          },
         })
         console.log(`Resample complete${chunkLabel}, channelWaveform length:`, channelWaveform.length)
 
@@ -390,7 +465,10 @@ function App() {
         const whisperWebOutput = await transcribe({
           channelWaveform,
           model: modelToUse,
-          onProgress: (progress) => setStatus(`Transcribing${chunkLabel} (${Math.round(progress * 100)}%)...`),
+          onProgress: (p) => {
+            updateOverall(i, 1, p, chunksToProcess)
+            setStatus(`Transcribing${chunkLabel} (${Math.round(p * 100)}%)...`)
+          },
         })
         console.log(`Transcribe complete${chunkLabel}`)
 
@@ -468,6 +546,8 @@ function App() {
 
       // Save to cache
       setStatus('Saving to cache...')
+      console.log('Preparing to save to cache, captions count:', allCaptions.length)
+
       const cacheData: CachedTranscript = {
         hash: fileHash,
         fileName: file.name,
@@ -479,10 +559,25 @@ function App() {
         captions: allCaptions
       }
 
-      await localforage.setItem(fileHash, cacheData)
-      console.log('Saved to cache with hash:', fileHash)
+      console.log('Cache data prepared:', {
+        hash: fileHash,
+        fileName: file.name,
+        fileSize: file.size,
+        captionsCount: allCaptions.length,
+        dataSize: JSON.stringify(cacheData).length + ' characters'
+      })
 
-      setStatus('Transcription complete!')
+      try {
+        await localforage.setItem(fileHash, cacheData)
+        console.log('Successfully saved to cache with hash:', fileHash)
+      } catch (cacheError) {
+        console.error('Failed to save to cache:', cacheError)
+        // Continue anyway, don't fail the whole process
+      }
+
+      setProgress(100)
+      const totalTime = (Date.now() - startTimeRef.current) / 1000
+      setStatus(`Transcription complete! (Total time: ${formatTime(totalTime)})`)
 
     } catch (error) {
       console.error('Error transcribing:', error)
@@ -599,8 +694,8 @@ function App() {
             )}
           </div>
           
-          <div style={{ 
-            padding: '1rem', 
+          <div style={{
+            padding: '1rem',
             backgroundColor: isProcessing ? '#fff3cd' : '#d4edda',
             border: `1px solid ${isProcessing ? '#ffeaa7' : '#c3e6cb'}`,
             borderRadius: '4px',
@@ -608,6 +703,38 @@ function App() {
             color: '#333'
           }}>
             <strong>Status:</strong> {status}
+
+            {isProcessing && progress > 0 && (
+              <div style={{ marginTop: '1rem' }}>
+                <div style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  marginBottom: '0.5rem',
+                  fontSize: '0.9em',
+                  color: '#666'
+                }}>
+                  <span>Progress: {Math.round(progress)}%</span>
+                  {estimatedTimeRemaining && (
+                    <span>Est. remaining: {estimatedTimeRemaining}</span>
+                  )}
+                </div>
+                <div style={{
+                  width: '100%',
+                  height: '20px',
+                  backgroundColor: '#e9ecef',
+                  borderRadius: '10px',
+                  overflow: 'hidden'
+                }}>
+                  <div style={{
+                    width: `${progress}%`,
+                    height: '100%',
+                    backgroundColor: '#4caf50',
+                    transition: 'width 0.3s ease',
+                    borderRadius: '10px'
+                  }} />
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -640,7 +767,6 @@ function App() {
             overflowY: 'auto',
             marginBottom: '2rem'
           }}>
-            <h3 style={{ color: '#333', marginTop: 0, marginBottom: '1rem' }}>Captions (Synced with Audio)</h3>
             {selectionMode && (
               <div style={{
                 marginBottom: '1rem',
@@ -649,7 +775,11 @@ function App() {
                 borderRadius: '4px',
                 display: 'flex',
                 justifyContent: 'space-between',
-                alignItems: 'center'
+                alignItems: 'center',
+                position: 'sticky',
+                top: '10px',
+                zIndex: 10,
+                boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
               }}>
                 <span style={{ color: '#666' }}>
                   Selection mode active - click another caption to select range
@@ -712,34 +842,36 @@ function App() {
 
         {subclipUrl && (
           <div style={{
-            marginTop: '2rem',
-            padding: '1rem',
+            marginTop: '1rem',
+            padding: '0.75rem',
             backgroundColor: '#e8f5e9',
             border: '2px solid #4caf50',
             borderRadius: '4px',
             position: 'sticky',
-            bottom: '20px'
+            bottom: '20px',
+            display: 'flex',
+            gap: '1rem',
+            alignItems: 'center'
           }}>
-            <h3 style={{ color: '#2e7d32', marginTop: 0, marginBottom: '1rem' }}>Audio Subclip</h3>
-            {selectedRange && (
-              <p style={{ color: '#666', fontSize: '0.9em', marginBottom: '1rem' }}>
-                Selected range: Caption {selectedRange.start + 1} to {selectedRange.end + 1}
-                ({((captionsData[selectedRange.end].endMs - captionsData[selectedRange.start].startMs) / 1000).toFixed(2)}s)
-              </p>
-            )}
             <audio
               ref={subclipAudioRef}
               controls
               src={subclipUrl}
-              style={{ width: '100%', marginBottom: '1rem' }}
+              style={{ flex: '1', minWidth: '200px' }}
             />
 
-            {/* Trim controls */}
-            <div style={{ marginBottom: '1rem', padding: '0.5rem', backgroundColor: '#fff', borderRadius: '4px' }}>
-              <p style={{ color: '#666', fontSize: '0.9em', marginBottom: '0.5rem' }}>
-                Trim: {((trimValues[0] / 100) * subclipDuration).toFixed(2)}s - {((trimValues[1] / 100) * subclipDuration).toFixed(2)}s
-                (Duration: {(((trimValues[1] - trimValues[0]) / 100) * subclipDuration).toFixed(2)}s)
-              </p>
+            <div style={{ flex: '0 0 300px', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              {selectedRange && (
+                <div style={{ fontSize: '0.85em', color: '#666' }}>
+                  Captions {selectedRange.start + 1}-{selectedRange.end + 1}
+                  ({((captionsData[selectedRange.end].endMs - captionsData[selectedRange.start].startMs) / 1000).toFixed(1)}s)
+                </div>
+              )}
+
+              <div style={{ fontSize: '0.85em', color: '#666' }}>
+                Trim: {((trimValues[0] / 100) * subclipDuration).toFixed(1)}-{((trimValues[1] / 100) * subclipDuration).toFixed(1)}s
+              </div>
+
               <ReactSlider
                 className="horizontal-slider"
                 thumbClassName="thumb"
@@ -754,15 +886,12 @@ function App() {
                     {...props}
                     style={{
                       ...props.style,
-                      height: '20px',
-                      width: '20px',
+                      height: '16px',
+                      width: '16px',
                       borderRadius: '50%',
                       backgroundColor: '#4caf50',
                       border: '2px solid #fff',
                       boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
                       cursor: 'grab'
                     }}
                   />
@@ -772,29 +901,14 @@ function App() {
                     {...props}
                     style={{
                       ...props.style,
-                      height: '6px',
-                      borderRadius: '3px',
+                      height: '4px',
+                      borderRadius: '2px',
                       backgroundColor: state.index === 1 ? '#4caf50' : '#ddd'
                     }}
                   />
                 )}
               />
             </div>
-
-            <button
-              onClick={clearSelection}
-              style={{
-                padding: '0.5rem 1rem',
-                backgroundColor: '#f44336',
-                color: 'white',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: 'pointer',
-                width: '100%'
-              }}
-            >
-              Clear Subclip
-            </button>
           </div>
         )}
 
