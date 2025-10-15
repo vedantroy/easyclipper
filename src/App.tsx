@@ -144,6 +144,13 @@ function chunkCaptionsSimple(
   return chunks
 }
 
+// Search helpers
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+const isTypingInInput = (el: EventTarget | null) =>
+  el && (el as HTMLElement).closest('input, textarea, [contenteditable="true"], [role="textbox"]')
+
+type Match = { chunkIdx: number; startIdx: number; endIdx: number }
+
 function App() {
   const [status, setStatus] = useState<string>('Ready to transcribe')
   const [transcription, setTranscription] = useState<string>('')
@@ -164,6 +171,14 @@ function App() {
   const [subclipDuration, setSubclipDuration] = useState<number>(0)
   const [progress, setProgress] = useState<number>(0)
   const [estimatedTimeRemaining, setEstimatedTimeRemaining] = useState<string>('')
+
+  // Search state
+  const [showSearch, setShowSearch] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [caseSensitive, setCaseSensitive] = useState(false)
+  const [wholeWord, setWholeWord] = useState(false)
+  const [activeMatch, setActiveMatch] = useState(-1)
+
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
   const subclipAudioRef = useRef<HTMLAudioElement>(null)
@@ -178,6 +193,54 @@ function App() {
     return { chunks: cs, wordToChunk: map }
   }, [captionsData])
 
+  // Memoized chunk texts and word offsets for search
+  const { chunkTexts, chunkWordOffsets } = useMemo(() => {
+    const texts = chunks.map(ch =>
+      captionsData.slice(ch.start, ch.end + 1).map(c => c.text).join(' ')
+    )
+    const offsets = chunks.map(ch => {
+      let offset = 0
+      const wordOffsets: number[] = []
+      for (let i = ch.start; i <= ch.end; i++) {
+        wordOffsets.push(offset)
+        offset += captionsData[i].text.length + (i < ch.end ? 1 : 0) // +1 for space
+      }
+      return wordOffsets
+    })
+    return { chunkTexts: texts, chunkWordOffsets: offsets }
+  }, [chunks, captionsData])
+
+  // Find all matches across chunks
+  const matches = useMemo((): Match[] => {
+    if (!searchQuery.trim()) return []
+
+    const results: Match[] = []
+    let pattern: RegExp
+
+    try {
+      const escaped = escapeRegExp(searchQuery.trim())
+      const flags = caseSensitive ? 'g' : 'gi'
+      const regex = wholeWord ? `\\b${escaped}\\b` : escaped
+      pattern = new RegExp(regex, flags)
+    } catch {
+      return [] // Invalid regex
+    }
+
+    chunkTexts.forEach((text, chunkIdx) => {
+      let match
+      while ((match = pattern.exec(text)) !== null) {
+        results.push({
+          chunkIdx,
+          startIdx: match.index,
+          endIdx: match.index + match[0].length
+        })
+        if (!pattern.global) break
+      }
+    })
+
+    return results
+  }, [searchQuery, caseSensitive, wholeWord, chunkTexts])
+
   // Auto-scroll to the active word's chunk
   useEffect(() => {
     if (activeCaptionIndex >= 0) {
@@ -189,6 +252,51 @@ function App() {
       }
     }
   }, [activeCaptionIndex, wordToChunk])
+
+  // Keyboard handlers for search
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ctrl+F to open search
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        if (!isTypingInInput(e.target)) {
+          e.preventDefault()
+          setShowSearch(true)
+        }
+      }
+
+      // Escape to close search
+      if (e.key === 'Escape' && showSearch) {
+        setShowSearch(false)
+        setSearchQuery('')
+        setActiveMatch(-1)
+      }
+
+      // Enter to navigate matches
+      if (e.key === 'Enter' && showSearch && matches.length > 0) {
+        e.preventDefault()
+        const newActiveMatch = e.shiftKey
+          ? (activeMatch - 1 + matches.length) % matches.length
+          : (activeMatch + 1) % matches.length
+        setActiveMatch(newActiveMatch)
+
+        // Scroll to match
+        const match = matches[newActiveMatch]
+        virtuosoRef.current?.scrollToIndex({
+          index: match.chunkIdx,
+          align: 'center',
+          behavior: 'smooth'
+        })
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [showSearch, matches, activeMatch])
+
+  // Reset active match when search changes
+  useEffect(() => {
+    setActiveMatch(matches.length > 0 ? 0 : -1)
+  }, [matches])
 
   // Simple, phase-aware progress + ETA (no 10/90 guessing)
   const NUM_PHASES = 2 // 0: resample, 1: transcribe
@@ -881,6 +989,84 @@ function App() {
           </div>
         )}
 
+        {/* Search UI */}
+        {showSearch && (
+          <div style={{
+            position: 'fixed',
+            top: '20px',
+            right: '20px',
+            backgroundColor: '#fff',
+            border: '1px solid #ccc',
+            borderRadius: '8px',
+            padding: '1rem',
+            boxShadow: '0 4px 8px rgba(0,0,0,0.1)',
+            zIndex: 1000,
+            minWidth: '300px'
+          }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <input
+                  type="text"
+                  placeholder="Search captions..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  style={{
+                    flex: 1,
+                    padding: '0.5rem',
+                    border: '1px solid #ccc',
+                    borderRadius: '4px'
+                  }}
+                  autoFocus
+                />
+                <button
+                  onClick={() => setShowSearch(false)}
+                  style={{
+                    padding: '0.5rem',
+                    backgroundColor: '#dc3545',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+
+              <div style={{ display: 'flex', gap: '1rem', fontSize: '0.9em' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={caseSensitive}
+                    onChange={(e) => setCaseSensitive(e.target.checked)}
+                  />
+                  Case sensitive
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={wholeWord}
+                    onChange={(e) => setWholeWord(e.target.checked)}
+                  />
+                  Whole word
+                </label>
+              </div>
+
+              {matches.length > 0 && (
+                <div style={{ fontSize: '0.85em', color: '#666', textAlign: 'center' }}>
+                  {activeMatch + 1} of {matches.length} matches
+                </div>
+              )}
+
+              {searchQuery && matches.length === 0 && (
+                <div style={{ fontSize: '0.85em', color: '#999', textAlign: 'center' }}>
+                  No matches found
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {captionsData.length > 0 && (
           <div
             style={{
@@ -933,19 +1119,17 @@ function App() {
                 itemContent={(chunkIdx) => {
                   const ch = chunks[chunkIdx]
                   const slice = captionsData.slice(ch.start, ch.end + 1)
-                  return (
-                    <p
-                      style={{
-                        margin: '8px 12px',
-                        lineHeight: 1.8,
-                        fontSize: '1.1em',
-                        color: '#333',
-                        whiteSpace: 'normal',
-                        wordBreak: 'break-word',
-                        textAlign: 'left',
-                      }}
-                    >
-                      {slice.map((c, i) => {
+                  const chunkText = chunkTexts[chunkIdx] || ''
+
+                  // Find matches for this chunk
+                  const chunkMatches = matches.filter(m => m.chunkIdx === chunkIdx)
+                  const activeChunkMatch = activeMatch >= 0 ? matches[activeMatch] : null
+
+                  // Render text with highlighting
+                  const renderWithHighlights = () => {
+                    if (!searchQuery.trim() || chunkMatches.length === 0) {
+                      // No search or no matches - render normally
+                      return slice.map((c, i) => {
                         const idx = ch.start + i
                         const isActive = idx === activeCaptionIndex
                         const isSelected =
@@ -982,7 +1166,121 @@ function App() {
                             {c.text}
                           </span>
                         )
-                      })}
+                      })
+                    }
+
+                    // Split text by matches for highlighting
+                    const sortedMatches = [...chunkMatches].sort((a, b) => a.startIdx - b.startIdx)
+                    const parts: Array<{ text: string; isMatch: boolean; isActiveMatch: boolean }> = []
+                    let lastEnd = 0
+
+                    sortedMatches.forEach(match => {
+                      // Add text before match
+                      if (match.startIdx > lastEnd) {
+                        parts.push({
+                          text: chunkText.slice(lastEnd, match.startIdx),
+                          isMatch: false,
+                          isActiveMatch: false
+                        })
+                      }
+                      // Add match
+                      parts.push({
+                        text: chunkText.slice(match.startIdx, match.endIdx),
+                        isMatch: true,
+                        isActiveMatch: activeChunkMatch === match
+                      })
+                      lastEnd = match.endIdx
+                    })
+
+                    // Add remaining text
+                    if (lastEnd < chunkText.length) {
+                      parts.push({
+                        text: chunkText.slice(lastEnd),
+                        isMatch: false,
+                        isActiveMatch: false
+                      })
+                    }
+
+                    // Convert back to spans with proper word mapping
+                    const result: React.ReactElement[] = []
+                    let wordIndex = 0
+
+                    parts.forEach((part, partIdx) => {
+                      const partWords = part.text.split(/(\s+)/)
+
+                      partWords.forEach((word, wordIdx) => {
+                        if (word.trim()) {
+                          // This is a word
+                          const idx = ch.start + wordIndex
+                          const isActive = idx === activeCaptionIndex
+                          const isSelected =
+                            selectedRange && idx >= selectedRange.start && idx <= selectedRange.end
+                          const isSelectionStart = selectedRange && idx === selectedRange.start
+                          const isSelectionEnd = selectedRange && idx === selectedRange.end
+
+                          const caption = slice[wordIndex]
+                          if (caption) {
+                            result.push(
+                              <span
+                                key={`${idx}-${partIdx}-${wordIdx}`}
+                                onClick={() => handleCaptionClick(idx)}
+                                style={{
+                                  padding: (isActive || isSelected) ? '2px 4px' : 0,
+                                  backgroundColor: part.isMatch
+                                    ? (part.isActiveMatch ? '#ff6b6b' : '#ffeb3b')
+                                    : (isSelected ? '#90EE90' : (isActive ? '#ffd700' : 'transparent')),
+                                  borderRadius: (isActive || isSelected || part.isMatch) ? 3 : 0,
+                                  transition: 'all 0.3s ease',
+                                  color: (isActive || isSelected || part.isMatch) ? '#000' : '#333',
+                                  fontWeight: (isActive || isSelected || part.isMatch) ? 'bold' : 'normal',
+                                  borderBottom: '1px solid #e0e0e0',
+                                  boxShadow: part.isActiveMatch
+                                    ? '0 2px 4px rgba(255, 107, 107, 0.5)'
+                                    : (part.isMatch
+                                      ? '0 2px 4px rgba(255, 235, 59, 0.5)'
+                                      : (isActive
+                                        ? '0 2px 4px rgba(255, 215, 0, 0.3)'
+                                        : (isSelected ? '0 2px 4px rgba(144, 238, 144, 0.3)' : 'none'))),
+                                  cursor: 'pointer',
+                                  userSelect: 'none',
+                                  border: isSelectionStart
+                                    ? '2px solid green'
+                                    : (isSelectionEnd ? '2px solid red' : 'none'),
+                                  textDecoration: 'underline',
+                                  textDecorationColor: '#999',
+                                  textDecorationThickness: '1px',
+                                  marginRight: 4
+                                }}
+                                title={`${(caption.startMs/1000).toFixed(2)}s → ${(caption.endMs/1000).toFixed(2)}s`}
+                              >
+                                {caption.text}
+                              </span>
+                            )
+                            wordIndex++
+                          }
+                        } else if (word) {
+                          // This is whitespace - add it without incrementing wordIndex
+                          result.push(<span key={`space-${partIdx}-${wordIdx}`}>{word}</span>)
+                        }
+                      })
+                    })
+
+                    return result
+                  }
+
+                  return (
+                    <p
+                      style={{
+                        margin: '8px 12px',
+                        lineHeight: 1.8,
+                        fontSize: '1.1em',
+                        color: '#333',
+                        whiteSpace: 'normal',
+                        wordBreak: 'break-word',
+                        textAlign: 'left',
+                      }}
+                    >
+                      {renderWithHighlights()}
                     </p>
                   )
                 }}
