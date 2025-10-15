@@ -22,6 +22,9 @@ interface CachedTranscript {
 // Stronger caption type for local use
 type Caption = { text: string; startMs: number; endMs: number; confidence: number | null }
 
+// Speed edit type for persistent highlighting
+type SpeedEdit = { startIdx: number; endIdx: number; rate: number }
+
 // Generate SHA-256 hash of file content
 async function hashFile(file: File): Promise<string> {
   const arrayBuffer = await file.arrayBuffer()
@@ -179,11 +182,21 @@ function App() {
   const [wholeWord, setWholeWord] = useState(false)
   const [activeMatch, setActiveMatch] = useState(-1)
 
+  // Fullscreen subclip modal state
+  const [showFullscreenSubclip, setShowFullscreenSubclip] = useState(false)
+  const [subclipSpeedSelection, setSubclipSpeedSelection] = useState<{start: number, end: number} | null>(null)
+  const [speedMultiplier, setSpeedMultiplier] = useState(1.0)
+  const [speedEdit, setSpeedEdit] = useState<SpeedEdit | null>(null)
+
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
   const subclipAudioRef = useRef<HTMLAudioElement>(null)
   const startTimeRef = useRef<number>(0)
   const virtuosoRef = useRef<VirtuosoHandle>(null)
+
+  // Helper to check if a word index is in the speed edit range
+  const isIdxInSpeedEdit = (idx: number) =>
+    !!(speedEdit && idx >= speedEdit.startIdx && idx <= speedEdit.endIdx)
 
   // Build chunks for virtualization (one chunk = one row).
   const { chunks, wordToChunk } = useMemo(() => {
@@ -530,6 +543,107 @@ function App() {
     if (subclipUrl) {
       URL.revokeObjectURL(subclipUrl)
       setSubclipUrl('')
+    }
+  }
+
+  const applySpeedAdjustment = async () => {
+    if (!audioBuffer || !selectedRange || !subclipSpeedSelection) return
+
+    try {
+      const audioContext = initAudioContext()
+
+      // Get the original subclip timing
+      const subclipStartMs = captionsData[selectedRange.start].startMs
+      const subclipEndMs = captionsData[selectedRange.end].endMs
+      const subclipStartTime = subclipStartMs / 1000
+      const subclipEndTime = subclipEndMs / 1000
+
+      // Apply trim values
+      const originalDuration = subclipEndTime - subclipStartTime
+      const trimStartOffset = (trimValues[0] / 100) * originalDuration
+      const trimEndOffset = (trimValues[1] / 100) * originalDuration
+      const trimmedStartTime = subclipStartTime + trimStartOffset
+      const trimmedEndTime = subclipStartTime + trimEndOffset
+
+      // Get the speed selection timing within the subclip (global indices for persisted edit)
+      const speedStartIdxGlobal = selectedRange.start + subclipSpeedSelection.start
+      const speedEndIdxGlobal = selectedRange.start + subclipSpeedSelection.end
+      const speedStartMs = captionsData[speedStartIdxGlobal].startMs
+      const speedEndMs = captionsData[speedEndIdxGlobal].endMs
+
+      // Calculate relative positions within the trimmed audio
+      const relativeSpeedStart = Math.max(0, (speedStartMs / 1000 - trimmedStartTime) / (trimmedEndTime - trimmedStartTime))
+      const relativeSpeedEnd = Math.min(1, (speedEndMs / 1000 - trimmedStartTime) / (trimmedEndTime - trimmedStartTime))
+
+      // Create the trimmed buffer
+      const trimmedBuffer = trimAudioBuffer(audioBuffer, trimmedStartTime, trimmedEndTime)
+      const sampleRate = trimmedBuffer.sampleRate
+      const totalSamples = trimmedBuffer.length
+
+      // Calculate sample positions for speed adjustment
+      const speedStartSample = Math.floor(relativeSpeedStart * totalSamples)
+      const speedEndSample = Math.floor(relativeSpeedEnd * totalSamples)
+
+      // Create output buffer with adjusted length
+      const speedAdjustedSamples = Math.floor((speedEndSample - speedStartSample) / speedMultiplier)
+      const newTotalSamples = totalSamples - (speedEndSample - speedStartSample) + speedAdjustedSamples
+
+      const outputBuffer = audioContext.createBuffer(
+        trimmedBuffer.numberOfChannels,
+        newTotalSamples,
+        sampleRate
+      )
+
+      // Process each channel
+      for (let channel = 0; channel < trimmedBuffer.numberOfChannels; channel++) {
+        const inputData = trimmedBuffer.getChannelData(channel)
+        const outputData = outputBuffer.getChannelData(channel)
+
+        let outputPos = 0
+
+        // Copy the part before speed adjustment
+        for (let i = 0; i < speedStartSample; i++) {
+          outputData[outputPos++] = inputData[i]
+        }
+
+        // Apply speed adjustment using simple resampling
+        for (let i = 0; i < speedAdjustedSamples; i++) {
+          const sourcePos = speedStartSample + (i * speedMultiplier)
+          const sourceIndex = Math.floor(sourcePos)
+          const fraction = sourcePos - sourceIndex
+
+          if (sourceIndex < speedEndSample - 1) {
+            // Linear interpolation
+            outputData[outputPos++] = inputData[sourceIndex] * (1 - fraction) + inputData[sourceIndex + 1] * fraction
+          } else if (sourceIndex < speedEndSample) {
+            outputData[outputPos++] = inputData[sourceIndex]
+          }
+        }
+
+        // Copy the part after speed adjustment
+        for (let i = speedEndSample; i < totalSamples; i++) {
+          outputData[outputPos++] = inputData[i]
+        }
+      }
+
+      // Convert to WAV and update subclip
+      const wavBlob = await audioBufferToWav(outputBuffer)
+      const url = URL.createObjectURL(wavBlob)
+
+      // Clean up old URL
+      if (subclipUrl) {
+        URL.revokeObjectURL(subclipUrl)
+      }
+
+      setSubclipUrl(url)
+
+      // Persist edit highlight & allow later clearing
+      setSpeedEdit({ startIdx: speedStartIdxGlobal, endIdx: speedEndIdxGlobal, rate: speedMultiplier })
+      setSubclipSpeedSelection(null) // Clear selection after applying
+
+    } catch (error) {
+      console.error('Error applying speed adjustment:', error)
+      alert('Error applying speed adjustment. Please try again.')
     }
   }
 
@@ -1003,14 +1117,7 @@ function App() {
         </div>
 
         {audioUrl && (
-          <div style={{
-            marginBottom: '2rem',
-            padding: '1rem',
-            backgroundColor: '#f8f9fa',
-            border: '1px solid #dee2e6',
-            borderRadius: '4px'
-          }}>
-            <h3 style={{ color: '#333', marginTop: 0, marginBottom: '1rem' }}>Audio Playback</h3>
+          <div style={{ marginBottom: '2rem' }}>
             <audio
               ref={audioRef}
               controls
@@ -1168,21 +1275,25 @@ function App() {
                           selectedRange && idx >= selectedRange.start && idx <= selectedRange.end
                         const isSelectionStart = selectedRange && idx === selectedRange.start
                         const isSelectionEnd = selectedRange && idx === selectedRange.end
+                        const isSpeedEdited = isIdxInSpeedEdit(idx)
                         return (
                           <span
                             key={idx}
                             onClick={(e) => handleWordClick(e, idx)}
                             style={{
-                              padding: (isActive || isSelected) ? '2px 4px' : 0,
+                              padding: (isActive || isSelected || isSpeedEdited) ? '2px 4px' : 0,
                               backgroundColor: isSelected ? '#90EE90' : (isActive ? '#ffd700' : 'transparent'),
-                              borderRadius: (isActive || isSelected) ? 3 : 0,
+                              borderRadius: (isActive || isSelected || isSpeedEdited) ? 3 : 0,
                               transition: 'all 0.3s ease',
-                              color: (isActive || isSelected) ? '#000' : '#333',
-                              fontWeight: (isActive || isSelected) ? 'bold' : 'normal',
+                              color: (isActive || isSelected || isSpeedEdited) ? '#000' : '#333',
+                              fontWeight: (isActive || isSelected || isSpeedEdited) ? 'bold' : 'normal',
                               borderBottom: '1px solid #e0e0e0',
-                              boxShadow: isActive
-                                ? '0 2px 4px rgba(255, 215, 0, 0.3)'
-                                : (isSelected ? '0 2px 4px rgba(144, 238, 144, 0.3)' : 'none'),
+                              outline: isSpeedEdited ? '2px solid #2196f3' : 'none',
+                              boxShadow: isSpeedEdited
+                                ? 'inset 0 0 0 9999px rgba(33,150,243,0.15)'
+                                : (isActive
+                                  ? '0 2px 4px rgba(255, 215, 0, 0.3)'
+                                  : (isSelected ? '0 2px 4px rgba(144, 238, 144, 0.3)' : 'none')),
                               cursor: 'pointer',
                               userSelect: 'none',
                               border: isSelectionStart
@@ -1193,7 +1304,7 @@ function App() {
                               textDecorationThickness: '1px',
                               marginRight: 4
                             }}
-                            title={`${(c.startMs/1000).toFixed(2)}s → ${(c.endMs/1000).toFixed(2)}s`}
+                            title={`${(c.startMs/1000).toFixed(2)}s → ${(c.endMs/1000).toFixed(2)}s${isSpeedEdited ? ` • Speed ${speedEdit!.rate}x` : ''}`}
                           >
                             {c.text}
                           </span>
@@ -1362,33 +1473,349 @@ function App() {
                 min={0}
                 max={100}
                 minDistance={5}
-                renderThumb={(props) => (
-                  <div
-                    {...props}
-                    style={{
-                      ...props.style,
-                      height: '16px',
-                      width: '16px',
-                      borderRadius: '50%',
-                      backgroundColor: '#4caf50',
-                      border: '2px solid #fff',
-                      boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
-                      cursor: 'grab'
-                    }}
-                  />
-                )}
-                renderTrack={(props, state) => (
-                  <div
-                    {...props}
-                    style={{
-                      ...props.style,
-                      height: '4px',
-                      borderRadius: '2px',
-                      backgroundColor: state.index === 1 ? '#4caf50' : '#ddd'
-                    }}
-                  />
-                )}
+                renderThumb={(props) => {
+                  const { key, ...restProps } = props
+                  return (
+                    <div
+                      key={key}
+                      {...restProps}
+                      style={{
+                        ...props.style,
+                        height: '16px',
+                        width: '16px',
+                        borderRadius: '50%',
+                        backgroundColor: '#4caf50',
+                        border: '2px solid #fff',
+                        boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
+                        cursor: 'grab'
+                      }}
+                    />
+                  )
+                }}
+                renderTrack={(props, state) => {
+                  const { key, ...restProps } = props
+                  return (
+                    <div
+                      key={key}
+                      {...restProps}
+                      style={{
+                        ...props.style,
+                        height: '4px',
+                        borderRadius: '2px',
+                        backgroundColor: state.index === 1 ? '#4caf50' : '#ddd'
+                      }}
+                    />
+                  )
+                }}
               />
+            </div>
+
+            {speedEdit && (
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                <span style={{
+                  fontSize: '0.9em',
+                  padding: '0.25rem 0.5rem',
+                  background: '#e3f2fd',
+                  border: '1px solid #90caf9',
+                  borderRadius: 4,
+                  whiteSpace: 'nowrap'
+                }}>
+                  Speed edit: words {speedEdit.startIdx + 1}-{speedEdit.endIdx + 1} at {speedEdit.rate}x
+                </span>
+                <button
+                  onClick={() => setSpeedEdit(null)}
+                  style={{
+                    padding: '0.35rem 0.75rem',
+                    backgroundColor: '#ef5350',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontSize: '0.8em'
+                  }}
+                >
+                  Clear speed edit
+                </button>
+              </div>
+            )}
+
+            <button
+              onClick={() => setShowFullscreenSubclip(true)}
+              style={{
+                padding: '0.5rem 1rem',
+                backgroundColor: '#2196f3',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '0.9em',
+                whiteSpace: 'nowrap'
+              }}
+            >
+              Fullscreen
+            </button>
+          </div>
+        )}
+
+        {/* Fullscreen Subclip Modal */}
+        {showFullscreenSubclip && subclipUrl && selectedRange && (
+          <div style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.8)',
+            zIndex: 2000,
+            display: 'flex',
+            flexDirection: 'column',
+            padding: '2rem'
+          }}>
+            <div style={{
+              backgroundColor: '#fff',
+              borderRadius: '8px',
+              flex: 1,
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden'
+            }}>
+              {/* Header */}
+              <div style={{
+                padding: '1rem',
+                borderBottom: '1px solid #ddd',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center'
+              }}>
+                <h2 style={{ margin: 0, color: '#333' }}>
+                  Subclip Editor - Captions {selectedRange.start + 1}-{selectedRange.end + 1}
+                </h2>
+                <button
+                  onClick={() => setShowFullscreenSubclip(false)}
+                  style={{
+                    padding: '0.5rem 1rem',
+                    backgroundColor: '#dc3545',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+
+              {/* Content */}
+              <div style={{
+                flex: 1,
+                display: 'flex',
+                flexDirection: 'column',
+                padding: '1rem',
+                gap: '1rem'
+              }}>
+                {/* Audio Controls */}
+                <div style={{
+                  display: 'flex',
+                  gap: '1rem',
+                  alignItems: 'center',
+                  padding: '1rem',
+                  backgroundColor: '#f8f9fa',
+                  borderRadius: '4px'
+                }}>
+                  <audio
+                    controls
+                    src={subclipUrl}
+                    style={{ flex: 1 }}
+                  />
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', minWidth: '200px' }}>
+                    <div style={{ fontSize: '0.9em', color: '#666' }}>
+                      Trim: {((trimValues[0] / 100) * subclipDuration).toFixed(1)}-{((trimValues[1] / 100) * subclipDuration).toFixed(1)}s
+                    </div>
+                    <ReactSlider
+                      className="horizontal-slider"
+                      thumbClassName="thumb"
+                      trackClassName="track"
+                      value={trimValues}
+                      onChange={(value) => handleTrimChange(value as [number, number])}
+                      min={0}
+                      max={100}
+                      minDistance={5}
+                      renderThumb={(props) => {
+                        const { key, ...restProps } = props
+                        return (
+                          <div
+                            key={key}
+                            {...restProps}
+                            style={{
+                              ...props.style,
+                              height: '16px',
+                              width: '16px',
+                              borderRadius: '50%',
+                              backgroundColor: '#4caf50',
+                              border: '2px solid #fff',
+                              boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
+                              cursor: 'grab'
+                            }}
+                          />
+                        )
+                      }}
+                      renderTrack={(props, state) => {
+                        const { key, ...restProps } = props
+                        return (
+                          <div
+                            key={key}
+                            {...restProps}
+                            style={{
+                              ...props.style,
+                              height: '4px',
+                              borderRadius: '2px',
+                              backgroundColor: state.index === 1 ? '#4caf50' : '#ddd'
+                            }}
+                          />
+                        )
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {/* Speed Controls */}
+                <div style={{
+                  padding: '1rem',
+                  backgroundColor: '#f0f8ff',
+                  borderRadius: '4px',
+                  border: '1px solid #cce7ff'
+                }}>
+                  <h3 style={{ margin: '0 0 1rem 0', color: '#333' }}>Speed Control</h3>
+                  <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '1rem' }}>
+                    <span style={{ color: '#666' }}>Speed:</span>
+                    {[1.0, 1.5, 2.0, 3.0, 4.0].map(speed => (
+                      <button
+                        key={speed}
+                        onClick={() => setSpeedMultiplier(speed)}
+                        style={{
+                          padding: '0.5rem 1rem',
+                          backgroundColor: speedMultiplier === speed ? '#2196f3' : '#fff',
+                          color: speedMultiplier === speed ? 'white' : '#333',
+                          border: '1px solid #2196f3',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        {speed}x
+                      </button>
+                    ))}
+                  </div>
+
+                  {subclipSpeedSelection && (
+                    <div style={{ color: '#666', fontSize: '0.9em' }}>
+                      Speed selection: Words {subclipSpeedSelection.start + 1}-{subclipSpeedSelection.end + 1} at {speedMultiplier}x
+                    </div>
+                  )}
+                </div>
+
+                {/* Subclip Words */}
+                <div style={{
+                  flex: 1,
+                  border: '1px solid #ddd',
+                  borderRadius: '4px',
+                  padding: '1rem',
+                  overflow: 'auto'
+                }}>
+                  <h3 style={{ margin: '0 0 1rem 0', color: '#333' }}>
+                    Words in Subclip (Select range for speed adjustment)
+                  </h3>
+                  <div style={{
+                    lineHeight: 1.8,
+                    fontSize: '1.1em'
+                  }}>
+                    {captionsData.slice(selectedRange.start, selectedRange.end + 1).map((caption, i) => {
+                      const globalIdx = selectedRange.start + i
+                      const isInSpeedSelection = subclipSpeedSelection &&
+                        i >= subclipSpeedSelection.start && i <= subclipSpeedSelection.end
+                      const isSpeedSelectionStart = subclipSpeedSelection && i === subclipSpeedSelection.start
+                      const isSpeedSelectionEnd = subclipSpeedSelection && i === subclipSpeedSelection.end
+                      const isPersisted = isIdxInSpeedEdit(globalIdx)
+
+                      return (
+                        <span
+                          key={globalIdx}
+                          onClick={() => {
+                            if (!subclipSpeedSelection) {
+                              setSubclipSpeedSelection({ start: i, end: i })
+                            } else {
+                              const start = Math.min(subclipSpeedSelection.start, i)
+                              const end = Math.max(subclipSpeedSelection.start, i)
+                              setSubclipSpeedSelection({ start, end })
+                            }
+                          }}
+                          style={{
+                            padding: (isInSpeedSelection || isPersisted) ? '2px 4px' : 0,
+                            backgroundColor: isInSpeedSelection ? '#ffeb3b' : (isPersisted ? '#e3f2fd' : 'transparent'),
+                            outline: isPersisted ? '2px solid #2196f3' : 'none',
+                            borderRadius: (isInSpeedSelection || isPersisted) ? 3 : 0,
+                            cursor: 'pointer',
+                            userSelect: 'none',
+                            border: isSpeedSelectionStart
+                              ? '2px solid #2196f3'
+                              : (isSpeedSelectionEnd ? '2px solid #f44336' : 'none'),
+                            marginRight: 4,
+                            transition: 'all 0.2s ease'
+                          }}
+                          title={`${(caption.startMs/1000).toFixed(2)}s → ${(caption.endMs/1000).toFixed(2)}s${isPersisted ? ` • Speed ${speedEdit!.rate}x` : ''}`}
+                        >
+                          {caption.text}
+                        </span>
+                      )
+                    })}
+                  </div>
+
+                  {subclipSpeedSelection && (
+                    <div style={{ marginTop: '1rem', display: 'flex', gap: '1rem' }}>
+                      <button
+                        onClick={() => setSubclipSpeedSelection(null)}
+                        style={{
+                          padding: '0.5rem 1rem',
+                          backgroundColor: '#dc3545',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Clear Selection
+                      </button>
+                      <button
+                        onClick={applySpeedAdjustment}
+                        style={{
+                          padding: '0.5rem 1rem',
+                          backgroundColor: '#28a745',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Apply {speedMultiplier}x Speed
+                      </button>
+                      {speedEdit && (
+                        <button
+                          onClick={() => setSpeedEdit(null)}
+                          style={{
+                            padding: '0.5rem 1rem',
+                            backgroundColor: '#ef5350',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '4px',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          Clear Persisted Edit
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         )}
