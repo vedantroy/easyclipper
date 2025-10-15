@@ -188,8 +188,8 @@ function App() {
   const [wholeWord, setWholeWord] = useState(false)
   const [activeMatch, setActiveMatch] = useState(-1)
 
-  // Fullscreen subclip modal state
-  const [showFullscreenSubclip, setShowFullscreenSubclip] = useState(false)
+  // Detail view subclip modal state
+  const [showDetailView, setShowDetailView] = useState(false)
   const [subclipSpeedSelection, setSubclipSpeedSelection] = useState<{start: number, end: number} | null>(null)
   const [speedMultiplier, setSpeedMultiplier] = useState(1.0)
   const [speedEdit, setSpeedEdit] = useState<SpeedEdit | null>(null)
@@ -1566,95 +1566,16 @@ function App() {
               style={{ flex: '1', minWidth: '200px' }}
             />
 
-            <div style={{ flex: '0 0 300px', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-              {selectedRange && (
-                <div style={{ fontSize: '0.85em', color: '#666' }}>
-                  Captions {selectedRange.start + 1}-{selectedRange.end + 1}
-                  ({((captionsData[selectedRange.end].endMs - captionsData[selectedRange.start].startMs) / 1000).toFixed(1)}s)
-                </div>
-              )}
-
-              <div style={{ fontSize: '0.85em', color: '#666' }}>
-                Trim: {((trimValues[0] / 100) * subclipDuration).toFixed(1)}-{((trimValues[1] / 100) * subclipDuration).toFixed(1)}s
-              </div>
-
-              <ReactSlider
-                className="horizontal-slider"
-                thumbClassName="thumb"
-                trackClassName="track"
-                value={trimValues}
-                onChange={(value) => handleTrimChange(value as [number, number])}
-                min={0}
-                max={100}
-                minDistance={5}
-                renderThumb={(props) => {
-                  const { key, ...restProps } = props
-                  return (
-                    <div
-                      key={key}
-                      {...restProps}
-                      style={{
-                        ...props.style,
-                        height: '16px',
-                        width: '16px',
-                        borderRadius: '50%',
-                        backgroundColor: '#4caf50',
-                        border: '2px solid #fff',
-                        boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
-                        cursor: 'grab'
-                      }}
-                    />
-                  )
-                }}
-                renderTrack={(props, state) => {
-                  const { key, ...restProps } = props
-                  return (
-                    <div
-                      key={key}
-                      {...restProps}
-                      style={{
-                        ...props.style,
-                        height: '4px',
-                        borderRadius: '2px',
-                        backgroundColor: state.index === 1 ? '#4caf50' : '#ddd'
-                      }}
-                    />
-                  )
-                }}
-              />
-            </div>
-
-            {speedEdit && (
-              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                <span style={{
-                  fontSize: '0.9em',
-                  padding: '0.25rem 0.5rem',
-                  background: '#e3f2fd',
-                  border: '1px solid #90caf9',
-                  borderRadius: 4,
-                  whiteSpace: 'nowrap'
-                }}>
-                  Speed edit: words {speedEdit.startIdx + 1}-{speedEdit.endIdx + 1} at {speedEdit.rate}x
-                </span>
-                <button
-                  onClick={() => { setSpeedEdit(null); setTransforms(prev => prev.filter(t => t.kind !== 'speed')) }}
-                  style={{
-                    padding: '0.35rem 0.75rem',
-                    backgroundColor: '#ef5350',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                    fontSize: '0.8em'
-                  }}
-                >
-                  Clear speed edit
-                </button>
+            {selectedRange && (
+              <div style={{ flex: '0 0 auto', fontSize: '0.85em', color: '#666' }}>
+                Captions {selectedRange.start + 1}-{selectedRange.end + 1}
+                ({((captionsData[selectedRange.end].endMs - captionsData[selectedRange.start].startMs) / 1000).toFixed(1)}s)
               </div>
             )}
 
+
             <button
-              onClick={() => setShowFullscreenSubclip(true)}
+              onClick={() => setShowDetailView(true)}
               style={{
                 padding: '0.5rem 1rem',
                 backgroundColor: '#2196f3',
@@ -1666,13 +1587,13 @@ function App() {
                 whiteSpace: 'nowrap'
               }}
             >
-              Fullscreen
+              Detail View
             </button>
           </div>
         )}
 
-        {/* Fullscreen Subclip Modal */}
-        {showFullscreenSubclip && subclipUrl && selectedRange && (
+        {/* Detail View Subclip Modal */}
+        {showDetailView && subclipUrl && selectedRange && (
           <div style={{
             position: 'fixed',
             top: 0,
@@ -1705,7 +1626,7 @@ function App() {
                   Subclip Editor - Captions {selectedRange.start + 1}-{selectedRange.end + 1}
                 </h2>
                 <button
-                  onClick={() => setShowFullscreenSubclip(false)}
+                  onClick={() => setShowDetailView(false)}
                   style={{
                     padding: '0.5rem 1rem',
                     backgroundColor: '#dc3545',
@@ -1877,7 +1798,8 @@ function App() {
                   border: '1px solid #ddd',
                   borderRadius: '4px',
                   padding: '1rem',
-                  overflow: 'auto'
+                  overflow: 'auto',
+                  maxHeight: '400px'
                 }}>
                   <h3 style={{ margin: '0 0 1rem 0', color: '#333' }}>
                     Words in Subclip (Select range for speed adjustment)
