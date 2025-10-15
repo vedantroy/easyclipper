@@ -5,6 +5,8 @@ import { useDropzone } from 'react-dropzone'
 import localforage from 'localforage'
 import { Virtuoso  } from 'react-virtuoso'
 import type { VirtuosoHandle } from 'react-virtuoso'
+// @ts-ignore
+import LibAV from '@libav.js/variant-default-cli'
 import './App.css'
 
 // Cache storage interface
@@ -29,6 +31,25 @@ type SpeedEdit = { startIdx: number; endIdx: number; rate: number }
 type SpeedXform = { kind: 'speed'; startSec: number; endSec: number; rate: number }
 type TrimXform  = { kind: 'trim';  startPct: number; endPct: number }
 type Transform  = SpeedXform | TrimXform
+
+// Initialize libav.js (CLI variant exposes libav.ffmpeg)
+let libavPromise: Promise<any> | null = null
+const getLibAV = () => {
+  if (!libavPromise) {
+    libavPromise = LibAV.LibAV({ noworker: true })
+  }
+  return libavPromise
+}
+
+// Chain atempo safely (FFmpeg limits each pass to [0.5,2.0])
+const atempoChain = (rate: number) => {
+  const parts: string[] = []
+  let r = Math.max(0.1, Math.min(10, rate))
+  while (r > 2.0 + 1e-6) { parts.push('atempo=2.0'); r /= 2 }
+  while (r < 0.5 - 1e-6) { parts.push('atempo=0.5'); r *= 2 }
+  parts.push(`atempo=${r.toFixed(3)}`)
+  return parts.join(',')
+}
 
 // Generate SHA-256 hash of file content
 async function hashFile(file: File): Promise<string> {
@@ -179,6 +200,7 @@ function App() {
   const [subclipDuration, setSubclipDuration] = useState<number>(0)
   const [progress, setProgress] = useState<number>(0)
   const [estimatedTimeRemaining, setEstimatedTimeRemaining] = useState<string>('')
+  const [originalFile, setOriginalFile] = useState<File | null>(null)
 
   // Search state
   const [showSearch, setShowSearch] = useState(false)
@@ -322,40 +344,127 @@ function App() {
     setActiveMatch(matches.length > 0 ? 0 : -1)
   }, [matches])
 
-  // 4) keep the UI duration in sync with transforms (users thought "speed" did nothing)
+  // Use libav.js for rendering with transforms
   useEffect(() => {
     const render = async () => {
-      if (!audioBuffer || !selectedRange) return
+      if (!originalFile || !audioBuffer || !selectedRange) return
+
+      // Base range (absolute, in seconds, from the full file)
       const baseStartSec = captionsData[selectedRange.start].startMs / 1000
       const baseEndSec   = captionsData[selectedRange.end].endMs   / 1000
-      const base = trimAudioBuffer(audioBuffer, baseStartSec, baseEndSec)
-      let cur = base
 
+      // Current transforms
       const speed = transforms.find(t => t.kind === 'speed') as SpeedXform | undefined
-      if (speed) cur = applySpeedSegment(cur, speed)
+      const trim  = transforms.find(t => t.kind === 'trim')  as TrimXform  | undefined
 
-      const trim = transforms.find(t => t.kind === 'trim') as TrimXform | undefined
-      if (trim) {
-        const baseDur = base.duration
-        const t0Base = (trim.startPct / 100) * baseDur
-        const t1Base = (trim.endPct   / 100) * baseDur
-        const t0 = speed ? mapTimeThroughSpeed(t0Base, speed) : t0Base
-        const t1 = speed ? mapTimeThroughSpeed(t1Base, speed) : t1Base
-        const [tStart, tEnd] = ensureAscending(t0, t1)
-        cur = trimAudioBuffer(cur, tStart, tEnd)
+      // Compute local speed segment (within the base range)
+      let speedStartLocal = 0, speedEndLocal = 0, tempo = 1
+      if (speed) {
+        speedStartLocal = Math.max(0, speed.startSec)
+        speedEndLocal   = Math.max(speedStartLocal, speed.endSec)
+        tempo = Math.max(0.1, speed.rate || 1)
       }
 
-      // NEW: reflect the *current* duration (after speed/trim) so the trim readout is correct
-      setSubclipDuration(cur.duration)
+      // Compute *final* trim (after speed) from % values using the provided mapper
+      const baseDur = baseEndSec - baseStartSec
+      const pct0 = trim ? trim.startPct / 100 : 0
+      const pct1 = trim ? trim.endPct   / 100 : 1
+      const t0Base = pct0 * baseDur
+      const t1Base = pct1 * baseDur
+      const t0 = speed ? mapTimeThroughSpeed(t0Base, { kind: 'speed', startSec: speedStartLocal, endSec: speedEndLocal, rate: tempo }) : t0Base
+      const t1 = speed ? mapTimeThroughSpeed(t1Base, { kind: 'speed', startSec: speedStartLocal, endSec: speedEndLocal, rate: tempo }) : t1Base
 
-      const wav = await audioBufferToWav(cur)
-      const url = URL.createObjectURL(wav)
-      if (subclipUrl) URL.revokeObjectURL(subclipUrl)
-      setSubclipUrl(url)
+      // Build filtergraph:
+      // 1) Cut the base selection
+      // 2) Split into [pre][seg][post], speed-change only the [seg]
+      // 3) Concat back
+      // 4) Apply final trim window (t0..t1) on the sped-up result
+      const preEnd = speed ? speedStartLocal : 0
+      const segStart = speed ? speedStartLocal : 0
+      const segEnd   = speed ? speedEndLocal   : 0
+
+      // Labels:
+      // [b]   -> base selection
+      // [a0]  -> pre
+      // [a1]  -> sped segment
+      // [a2]  -> post
+      // [cat] -> concatenated
+      const parts: string[] = []
+      parts.push(`[0:a]atrim=start=${baseStartSec.toFixed(6)}:end=${baseEndSec.toFixed(6)},asetpts=N/SR/TB[b]`)
+      if (speed && Math.abs(tempo - 1) > 0.01) {
+        // Only apply speed if it's meaningfully different from 1x
+        parts.push(`[b]atrim=start=0:end=${preEnd.toFixed(6)},asetpts=N/SR/TB[a0]`)
+        parts.push(`[b]atrim=start=${segStart.toFixed(6)}:end=${segEnd.toFixed(6)},asetpts=N/SR/TB,${atempoChain(tempo)}[a1]`)
+        parts.push(`[b]atrim=start=${segEnd.toFixed(6)},asetpts=N/SR/TB[a2]`)
+        parts.push(`[a0][a1][a2]concat=n=3:v=0:a=1[cat]`)
+      } else {
+        parts.push(`[b]anull[cat]`)
+      }
+      parts.push(`[cat]atrim=start=${Math.max(0, t0).toFixed(6)}:end=${Math.max(t0, t1).toFixed(6)},asetpts=N/SR/TB[out]`)
+      const filterComplex = parts.join(';')
+
+      // Debug logging
+      console.log('LibAV Filter Complex:', {
+        baseStartSec,
+        baseEndSec,
+        speed,
+        tempo,
+        speedStartLocal,
+        speedEndLocal,
+        trim,
+        t0,
+        t1,
+        filterComplex
+      })
+
+      // Run libav.js CLI
+      const libav = await getLibAV()
+      const inName  = `in-${crypto.randomUUID()}`
+      const outName = `out-${crypto.randomUUID()}.wav`
+
+      try {
+        await libav.writeFile(inName, new Uint8Array(await originalFile.arrayBuffer()))
+
+        const ffmpegArgs = [
+          '-hide_banner', '-loglevel', 'error',
+          '-i', inName,
+          '-filter_complex', filterComplex,
+          '-map', '[out]',
+          '-c:a', 'pcm_s16le',
+          outName
+        ]
+
+        console.log('FFmpeg command:', 'ffmpeg', ffmpegArgs.join(' '))
+
+        // -hide_banner/-loglevel keep console noise down; pcm_s16le wav is widely compatible
+        await libav.ffmpeg(...ffmpegArgs)
+
+        const data = await libav.readFile(outName)
+        const blob = new Blob([data.buffer], { type: 'audio/wav' })
+        const url = URL.createObjectURL(blob)
+
+        // Update UI URL
+        if (subclipUrl) URL.revokeObjectURL(subclipUrl)
+        setSubclipUrl(url)
+
+        // Update displayed duration by decoding the output quickly
+        try {
+          const ab = await blob.arrayBuffer()
+          const buf = await initAudioContext().decodeAudioData(ab)
+          setSubclipDuration(buf.duration)
+        } catch {
+          // fall back to baseDur if decode fails
+          setSubclipDuration(Math.max(0, Math.max(t0, t1) - Math.min(t0, t1)))
+        }
+      } finally {
+        // clean up FS
+        try { await libav.unlink(inName) } catch {}
+        try { await libav.unlink(outName) } catch {}
+      }
     }
     render()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [audioBuffer, selectedRange, transforms])
+  }, [originalFile, audioBuffer, selectedRange, transforms])
 
   // Simple, phase-aware progress + ETA (no 10/90 guessing)
   const NUM_PHASES = 2 // 0: resample, 1: transcribe
@@ -635,6 +744,7 @@ function App() {
     onDrop: (acceptedFiles) => {
       const file = acceptedFiles[0]
       if (file) {
+        setOriginalFile(file)
         processFile(file)
       }
     },
@@ -677,6 +787,7 @@ function App() {
     setProgress(0)
     startTimeRef.current = Date.now()
     setEstimatedTimeRemaining('')
+    setOriginalFile(file)
 
     // Create URL for audio playback
     const url = URL.createObjectURL(file)

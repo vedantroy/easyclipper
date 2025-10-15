@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [react()],
   optimizeDeps: {
     // turn off dependency optimization: https://github.com/vitejs/vite/issues/11672#issuecomment-1397855641
-    exclude: ['@remotion/whisper-web'],
+    exclude: ['@remotion/whisper-web', '@libav.js/variant-default-cli'],
   },
   // required by SharedArrayBuffer
   server: {
