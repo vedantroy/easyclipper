@@ -24,7 +24,7 @@ interface CachedTranscript {
 type Caption = { text: string; startMs: number; endMs: number; confidence: number | null }
 
 // Speed edit type for persistent highlighting
-type SpeedEdit = { startIdx: number; endIdx: number; rate: number }
+type SpeedEdit = { id: string; startIdx: number; endIdx: number; rate: number }
 
 // --- Transform pipeline types ---
 type SpeedXform = { kind: 'speed'; startSec: number; endSec: number; rate: number }
@@ -192,7 +192,7 @@ function App() {
   const [showDetailView, setShowDetailView] = useState(false)
   const [subclipSpeedSelection, setSubclipSpeedSelection] = useState<{start: number, end: number} | null>(null)
   const [speedMultiplier, setSpeedMultiplier] = useState(1.0)
-  const [speedEdit, setSpeedEdit] = useState<SpeedEdit | null>(null)
+  const [speedEdits, setSpeedEdits] = useState<SpeedEdit[]>([])
   const [transforms, setTransforms] = useState<Transform[]>([])
 
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -201,9 +201,23 @@ function App() {
   const startTimeRef = useRef<number>(0)
   const virtuosoRef = useRef<VirtuosoHandle>(null)
 
-  // Helper to check if a word index is in the speed edit range
-  const isIdxInSpeedEdit = (idx: number) =>
-    !!(speedEdit && idx >= speedEdit.startIdx && idx <= speedEdit.endIdx)
+  // Helper to check if a word index is in any speed edit range
+  const isIdxInSpeedEdit = (idx: number) => {
+    return speedEdits.some(edit => idx >= edit.startIdx && idx <= edit.endIdx)
+  }
+
+  // Get speed edit for a specific index
+  const getSpeedEditForIdx = (idx: number): SpeedEdit | undefined => {
+    return speedEdits.find(edit => idx >= edit.startIdx && idx <= edit.endIdx)
+  }
+
+  // Check if a range overlaps with existing speed edits
+  const hasOverlap = (startIdx: number, endIdx: number, excludeId?: string) => {
+    return speedEdits.some(edit => {
+      if (excludeId && edit.id === excludeId) return false
+      return !(endIdx < edit.startIdx || startIdx > edit.endIdx)
+    })
+  }
 
   // --- fixes ---
   // 1) safer time helpers
@@ -332,16 +346,18 @@ function App() {
       const base = trimAudioBuffer(audioBuffer, baseStartSec, baseEndSec)
       let cur = base
 
-      const speed = transforms.find(t => t.kind === 'speed') as SpeedXform | undefined
-      if (speed) cur = applySpeedSegment(cur, speed)
+      const speedTransforms = transforms.filter(t => t.kind === 'speed') as SpeedXform[]
+      if (speedTransforms.length > 0) {
+        cur = applyMultipleSpeedSegments(cur, speedTransforms)
+      }
 
       const trim = transforms.find(t => t.kind === 'trim') as TrimXform | undefined
       if (trim) {
         const baseDur = base.duration
         const t0Base = (trim.startPct / 100) * baseDur
         const t1Base = (trim.endPct   / 100) * baseDur
-        const t0 = speed ? mapTimeThroughSpeed(t0Base, speed) : t0Base
-        const t1 = speed ? mapTimeThroughSpeed(t1Base, speed) : t1Base
+        const t0 = speedTransforms.length > 0 ? mapTimeThroughMultipleSpeeds(t0Base, speedTransforms) : t0Base
+        const t1 = speedTransforms.length > 0 ? mapTimeThroughMultipleSpeeds(t1Base, speedTransforms) : t1Base
         const [tStart, tEnd] = ensureAscending(t0, t1)
         cur = trimAudioBuffer(cur, tStart, tEnd)
       }
@@ -462,42 +478,61 @@ function App() {
   //   return out
   // }
 
-  // WSOLA-based time stretching with proper sectioning
-  const applySpeedSegment = (buffer: AudioBuffer, xf: SpeedXform): AudioBuffer => {
-    const rate = Number.isFinite(xf.rate) && xf.rate > 0 ? xf.rate : 1
-    const sr = buffer.sampleRate
-    const startSample = clamp(Math.floor(xf.startSec * sr), 0, buffer.length)
-    const endSample = clamp(Math.floor(xf.endSec * sr), startSample, buffer.length)
+  // Apply multiple speed segments
+  const applyMultipleSpeedSegments = (buffer: AudioBuffer, speedTransforms: SpeedXform[]): AudioBuffer => {
+    if (speedTransforms.length === 0) return buffer
 
-    // No change needed
-    if (rate === 1 || endSample <= startSample) return buffer
+    // Sort speed transforms by start time
+    const sortedTransforms = [...speedTransforms].sort((a, b) => a.startSec - b.startSec)
 
     const ctx = initAudioContext()
-
-    // Process each channel
+    const sr = buffer.sampleRate
     const outputChannels: Float32Array[] = []
 
     for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
       const channelData = buffer.getChannelData(ch)
+      const segments: Float32Array[] = []
+      let lastEndSample = 0
 
-      // Split into three sections: before, middle (to be sped up), after
-      const before = channelData.slice(0, startSample)
-      const middle = channelData.slice(startSample, endSample)
-      const after = channelData.slice(endSample)
+      for (const xf of sortedTransforms) {
+        const rate = Number.isFinite(xf.rate) && xf.rate > 0 ? xf.rate : 1
+        const startSample = clamp(Math.floor(xf.startSec * sr), 0, buffer.length)
+        const endSample = clamp(Math.floor(xf.endSec * sr), startSample, buffer.length)
 
-      // Process middle section with WSOLA
-      const processedMiddle = timeStretchWSEW(middle, rate, sr)
+        // Add unprocessed segment before this speed edit
+        if (lastEndSample < startSample) {
+          segments.push(channelData.slice(lastEndSample, startSample))
+        }
 
-      // Concatenate all three sections
-      const outputChannel = new Float32Array(before.length + processedMiddle.length + after.length)
-      outputChannel.set(before, 0)
-      outputChannel.set(processedMiddle, before.length)
-      outputChannel.set(after, before.length + processedMiddle.length)
+        // Process the speed segment
+        if (rate !== 1 && endSample > startSample) {
+          const middle = channelData.slice(startSample, endSample)
+          segments.push(timeStretchWSEW(middle, rate, sr))
+        } else {
+          segments.push(channelData.slice(startSample, endSample))
+        }
+
+        lastEndSample = endSample
+      }
+
+      // Add remaining unprocessed audio
+      if (lastEndSample < channelData.length) {
+        segments.push(channelData.slice(lastEndSample))
+      }
+
+      // Concatenate all segments
+      const totalLength = segments.reduce((sum, seg) => sum + seg.length, 0)
+      const outputChannel = new Float32Array(totalLength)
+      let offset = 0
+      for (const seg of segments) {
+        outputChannel.set(seg, offset)
+        offset += seg.length
+      }
 
       outputChannels.push(outputChannel)
     }
 
-    // Create output buffer with concatenated sections
+    // Create output buffer
     const outputBuffer = ctx.createBuffer(
       buffer.numberOfChannels,
       outputChannels[0].length,
@@ -591,14 +626,33 @@ function App() {
     return output
   }
 
-  // 2) make the mapping robust (base-time -> post-speed time)
-  const mapTimeThroughSpeed = (t: number, s: SpeedXform) => {
-    let { startSec: a, endSec: b, rate: r } = s
-    r = Number.isFinite(r) && r > 0 ? r : 1
-    ;[a, b] = ensureAscending(a, b)
-    if (t <= a) return t
-    if (t <= b) return a + (t - a) / r
-    return a + (b - a) / r + (t - b)
+  // Map time through multiple speed segments
+  const mapTimeThroughMultipleSpeeds = (t: number, speedTransforms: SpeedXform[]): number => {
+    if (speedTransforms.length === 0) return t
+
+    // Sort transforms by start time
+    const sorted = [...speedTransforms].sort((a, b) => a.startSec - b.startSec)
+    let currentTime = t
+    let offset = 0
+
+    for (const xf of sorted) {
+      const rate = Number.isFinite(xf.rate) && xf.rate > 0 ? xf.rate : 1
+      const [startSec, endSec] = ensureAscending(xf.startSec, xf.endSec)
+
+      if (currentTime <= startSec) {
+        // Time is before this segment
+        return offset + currentTime
+      } else if (currentTime <= endSec) {
+        // Time is within this segment
+        return offset + startSec + (currentTime - startSec) / rate
+      } else {
+        // Time is after this segment, accumulate offset
+        offset += startSec + (endSec - startSec) / rate - endSec
+        currentTime = currentTime // Keep original time for next iteration
+      }
+    }
+
+    return offset + currentTime
   }
 
   const audioBufferToWav = async (buffer: AudioBuffer): Promise<Blob> => {
@@ -746,18 +800,42 @@ function App() {
 
   const applySpeedAdjustment = () => {
     if (!audioBuffer || !selectedRange || !subclipSpeedSelection) return
-    const baseStartSec = captionsData[selectedRange.start].startMs / 1000
-    const startIdx = selectedRange.start + subclipSpeedSelection.start
-    const endIdx   = selectedRange.start + subclipSpeedSelection.end
-    const startSecLocal = Math.max(0, captionsData[startIdx].startMs / 1000 - baseStartSec)
-    const endSecLocal   = Math.max(startSecLocal, captionsData[endIdx].endMs   / 1000 - baseStartSec)
 
+    const startIdx = selectedRange.start + subclipSpeedSelection.start
+    const endIdx = selectedRange.start + subclipSpeedSelection.end
+
+    // Check for overlaps
+    if (hasOverlap(startIdx, endIdx)) {
+      alert('This selection overlaps with an existing speed edit. Please choose a different range.')
+      return
+    }
+
+    const baseStartSec = captionsData[selectedRange.start].startMs / 1000
+    const startSecLocal = Math.max(0, captionsData[startIdx].startMs / 1000 - baseStartSec)
+    const endSecLocal = Math.max(startSecLocal, captionsData[endIdx].endMs / 1000 - baseStartSec)
+
+    // Add new speed edit
+    const newEdit: SpeedEdit = {
+      id: `speed-${Date.now()}`,
+      startIdx,
+      endIdx,
+      rate: speedMultiplier
+    }
+
+    setSpeedEdits(prev => [...prev, newEdit])
+
+    // Update transforms with all speed edits
     setTransforms(prev => {
-      const others = prev.filter(t => t.kind !== 'speed')
-      return [...others, { kind: 'speed', startSec: startSecLocal, endSec: endSecLocal, rate: speedMultiplier }]
+      const nonSpeedTransforms = prev.filter(t => t.kind !== 'speed')
+      const speedTransforms: Transform[] = [...speedEdits, newEdit].map(edit => ({
+        kind: 'speed' as const,
+        startSec: captionsData[edit.startIdx].startMs / 1000 - baseStartSec,
+        endSec: captionsData[edit.endIdx].endMs / 1000 - baseStartSec,
+        rate: edit.rate
+      }))
+      return [...nonSpeedTransforms, ...speedTransforms]
     })
 
-    setSpeedEdit({ startIdx, endIdx, rate: speedMultiplier })
     setSubclipSpeedSelection(null)
   }
 
@@ -1418,7 +1496,10 @@ function App() {
                               textDecorationThickness: '1px',
                               marginRight: 4
                             }}
-                            title={`${(c.startMs/1000).toFixed(2)}s → ${(c.endMs/1000).toFixed(2)}s${isSpeedEdited ? ` • Speed ${speedEdit!.rate}x` : ''}`}
+                            title={(() => {
+                              const edit = getSpeedEditForIdx(idx)
+                              return `${(c.startMs/1000).toFixed(2)}s → ${(c.endMs/1000).toFixed(2)}s${edit ? ` • Speed ${edit.rate}x` : ''}`
+                            })()}
                           >
                             {c.text}
                           </span>
@@ -1714,7 +1795,7 @@ function App() {
                 </div>
 
                 {/* Applied Transformations */}
-                {speedEdit && (
+                {speedEdits.length > 0 && (
                   <div style={{
                     padding: '1rem',
                     backgroundColor: '#f8f9fa',
@@ -1722,37 +1803,63 @@ function App() {
                     border: '1px solid #dee2e6'
                   }}>
                     <h3 style={{ margin: '0 0 1rem 0', color: '#333' }}>Applied Transformations</h3>
-                    <div style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      padding: '0.75rem',
-                      backgroundColor: '#e3f2fd',
-                      border: '1px solid #90caf9',
-                      borderRadius: '4px'
-                    }}>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
-                        <span style={{ fontSize: '1em', fontWeight: 'bold', color: '#1976d2' }}>
-                          Speed Adjustment: {speedEdit.rate}x
-                        </span>
-                        <span style={{ fontSize: '0.9em', color: '#666' }}>
-                          Applied to words {speedEdit.startIdx + 1}-{speedEdit.endIdx + 1}
-                        </span>
-                      </div>
-                      <button
-                        onClick={() => { setSpeedEdit(null); setTransforms(prev => prev.filter(t => t.kind !== 'speed')) }}
-                        style={{
-                          padding: '0.5rem 1rem',
-                          backgroundColor: '#dc3545',
-                          color: 'white',
-                          border: 'none',
-                          borderRadius: '4px',
-                          cursor: 'pointer',
-                          fontSize: '0.9em'
-                        }}
-                      >
-                        Delete
-                      </button>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                      {speedEdits.map(edit => {
+                        const relativeStart = edit.startIdx - selectedRange.start + 1
+                        const relativeEnd = edit.endIdx - selectedRange.start + 1
+                        return (
+                          <div
+                            key={edit.id}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              padding: '0.75rem',
+                              backgroundColor: '#e3f2fd',
+                              border: '1px solid #90caf9',
+                              borderRadius: '4px'
+                            }}
+                          >
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                              <span style={{ fontSize: '1em', fontWeight: 'bold', color: '#1976d2' }}>
+                                Speed Adjustment: {edit.rate}x
+                              </span>
+                              <span style={{ fontSize: '0.9em', color: '#666' }}>
+                                Applied to words {relativeStart}-{relativeEnd}
+                              </span>
+                            </div>
+                            <button
+                              onClick={() => {
+                                setSpeedEdits(prev => prev.filter(e => e.id !== edit.id))
+                                setTransforms(prev => {
+                                  const nonSpeed = prev.filter(t => t.kind !== 'speed')
+                                  const baseStartSec = captionsData[selectedRange.start].startMs / 1000
+                                  const speedTransforms = speedEdits
+                                    .filter(e => e.id !== edit.id)
+                                    .map(e => ({
+                                      kind: 'speed' as const,
+                                      startSec: captionsData[e.startIdx].startMs / 1000 - baseStartSec,
+                                      endSec: captionsData[e.endIdx].endMs / 1000 - baseStartSec,
+                                      rate: e.rate
+                                    }))
+                                  return [...nonSpeed, ...speedTransforms]
+                                })
+                              }}
+                              style={{
+                                padding: '0.5rem 1rem',
+                                backgroundColor: '#dc3545',
+                                color: 'white',
+                                border: 'none',
+                                borderRadius: '4px',
+                                cursor: 'pointer',
+                                fontSize: '0.9em'
+                              }}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        )
+                      })}
                     </div>
                   </div>
                 )}
@@ -1841,7 +1948,10 @@ function App() {
                             marginRight: 4,
                             transition: 'all 0.2s ease'
                           }}
-                          title={`${(caption.startMs/1000).toFixed(2)}s → ${(caption.endMs/1000).toFixed(2)}s${isPersisted ? ` • Speed ${speedEdit!.rate}x` : ''}`}
+                          title={(() => {
+                            const edit = getSpeedEditForIdx(globalIdx)
+                            return `${(caption.startMs/1000).toFixed(2)}s → ${(caption.endMs/1000).toFixed(2)}s${edit ? ` • Speed ${edit.rate}x` : ''}`
+                          })()}
                         >
                           {caption.text}
                         </span>
@@ -1877,9 +1987,12 @@ function App() {
                       >
                         Apply {speedMultiplier}x Speed
                       </button>
-                      {speedEdit && (
+                      {speedEdits.length > 0 && (
                         <button
-                          onClick={() => { setSpeedEdit(null); setTransforms(prev => prev.filter(t => t.kind !== 'speed')) }}
+                          onClick={() => {
+                            setSpeedEdits([])
+                            setTransforms(prev => prev.filter(t => t.kind !== 'speed'))
+                          }}
                           style={{
                             padding: '0.5rem 1rem',
                             backgroundColor: '#ef5350',
@@ -1889,7 +2002,7 @@ function App() {
                             cursor: 'pointer'
                           }}
                         >
-                          Clear Persisted Edit
+                          Clear All Speed Edits
                         </button>
                       )}
                     </div>
