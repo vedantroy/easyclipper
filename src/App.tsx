@@ -25,6 +25,11 @@ type Caption = { text: string; startMs: number; endMs: number; confidence: numbe
 // Speed edit type for persistent highlighting
 type SpeedEdit = { startIdx: number; endIdx: number; rate: number }
 
+// --- Transform pipeline types ---
+type SpeedXform = { kind: 'speed'; startSec: number; endSec: number; rate: number }
+type TrimXform  = { kind: 'trim';  startPct: number; endPct: number }
+type Transform  = SpeedXform | TrimXform
+
 // Generate SHA-256 hash of file content
 async function hashFile(file: File): Promise<string> {
   const arrayBuffer = await file.arrayBuffer()
@@ -187,6 +192,7 @@ function App() {
   const [subclipSpeedSelection, setSubclipSpeedSelection] = useState<{start: number, end: number} | null>(null)
   const [speedMultiplier, setSpeedMultiplier] = useState(1.0)
   const [speedEdit, setSpeedEdit] = useState<SpeedEdit | null>(null)
+  const [transforms, setTransforms] = useState<Transform[]>([])
 
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
@@ -311,6 +317,38 @@ function App() {
     setActiveMatch(matches.length > 0 ? 0 : -1)
   }, [matches])
 
+  // --- Compose & render pipeline (speed then trim) ---
+  // Recompute subclipUrl whenever selection, audio, or transforms change
+  useEffect(() => {
+    const render = async () => {
+      if (!audioBuffer || !selectedRange) return
+      const baseStartSec = captionsData[selectedRange.start].startMs / 1000
+      const baseEndSec   = captionsData[selectedRange.end].endMs   / 1000
+      const base = trimAudioBuffer(audioBuffer, baseStartSec, baseEndSec)
+      let cur = base
+
+      const speed = transforms.find(t => t.kind === 'speed') as SpeedXform | undefined
+      if (speed) cur = applySpeedSegment(cur, speed)
+
+      const trim = transforms.find(t => t.kind === 'trim') as TrimXform | undefined
+      if (trim) {
+        const baseDur = base.duration
+        const t0Base = (trim.startPct / 100) * baseDur
+        const t1Base = (trim.endPct   / 100) * baseDur
+        const t0 = speed ? mapTimeThroughSpeed(t0Base, speed) : t0Base
+        const t1 = speed ? mapTimeThroughSpeed(t1Base, speed) : t1Base
+        cur = trimAudioBuffer(cur, t0, t1)
+      }
+
+      const wav = await audioBufferToWav(cur)
+      const url = URL.createObjectURL(wav)
+      if (subclipUrl) URL.revokeObjectURL(subclipUrl)
+      setSubclipUrl(url)
+    }
+    render()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [audioBuffer, selectedRange, transforms])
+
   // Simple, phase-aware progress + ETA (no 10/90 guessing)
   const NUM_PHASES = 2 // 0: resample, 1: transcribe
   const updateOverall = (chunkIndex: number, phaseIndex: number, phaseProgress: number, chunksTotal: number) => {
@@ -366,6 +404,46 @@ function App() {
     }
 
     return trimmedBuffer
+  }
+
+  // Apply a speed change to [startSec, endSec] within `buffer`
+  const applySpeedSegment = (buffer: AudioBuffer, xf: SpeedXform): AudioBuffer => {
+    const ctx = initAudioContext()
+    const { startSec, endSec, rate } = xf
+    const sampleRate = buffer.sampleRate
+    const startSample = Math.max(0, Math.floor(startSec * sampleRate))
+    const endSample   = Math.min(buffer.length, Math.floor(endSec * sampleRate))
+    const preLen      = startSample
+    const segLen      = Math.max(0, endSample - startSample)
+    const segOutLen   = Math.floor(segLen / Math.max(0.0001, rate))
+    const outLen      = preLen + segOutLen + (buffer.length - endSample)
+    const out = ctx.createBuffer(buffer.numberOfChannels, outLen, sampleRate)
+    for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+      const inCh  = buffer.getChannelData(ch)
+      const outCh = out.getChannelData(ch)
+      let o = 0
+      // copy pre
+      for (let i = 0; i < preLen; i++) outCh[o++] = inCh[i]
+      // resample segment (linear)
+      for (let i = 0; i < segOutLen; i++) {
+        const pos = startSample + i * rate
+        const idx = Math.floor(pos)
+        const frac = pos - idx
+        if (idx < endSample - 1) outCh[o++] = inCh[idx]*(1-frac) + inCh[idx+1]*frac
+        else outCh[o++] = inCh[Math.min(idx, endSample-1)]
+      }
+      // copy post
+      for (let i = endSample; i < buffer.length; i++) outCh[o++] = inCh[i]
+    }
+    return out
+  }
+
+  // Map a time (in seconds) through a speed segment (used so TRIM runs *after* speed)
+  const mapTimeThroughSpeed = (t: number, s: SpeedXform) => {
+    const { startSec: a, endSec: b, rate: r } = s
+    if (t <= a) return t
+    if (t <= b) return a + (t - a) / r
+    return a + (b - a) / r + (t - b)
   }
 
   const audioBufferToWav = async (buffer: AudioBuffer): Promise<Blob> => {
@@ -480,171 +558,53 @@ function App() {
 
       setSelectedRange({ start: startIdx, end: endIdx })
 
-      // Create subclip
+      // Set up base subclip metadata; pipeline effect will render audio
       if (audioBuffer) {
         const startMs = captionsData[startIdx].startMs
-        const endMs = captionsData[endIdx].endMs
-
-        const startTime = startMs / 1000
-        const endTime = endMs / 1000
-
-        const duration = endTime - startTime
-        setSubclipDuration(duration)
-        setTrimValues([0, 100]) // Reset trim values
-
-        const trimmedBuffer = trimAudioBuffer(audioBuffer, startTime, endTime)
-        const wavBlob = await audioBufferToWav(trimmedBuffer)
-        const url = URL.createObjectURL(wavBlob)
-
-        // Clean up old URL if exists
-        if (subclipUrl) {
-          URL.revokeObjectURL(subclipUrl)
-        }
-
-        setSubclipUrl(url)
+        const endMs   = captionsData[endIdx].endMs
+        setSubclipDuration((endMs - startMs) / 1000)
+        setTrimValues([0, 100])
+        // reset transforms (no speed by default; trim 0..100 no-op)
+        setTransforms([{ kind: 'trim', startPct: 0, endPct: 100 }])
       }
     }
   }
 
-  const handleTrimChange = async (values: [number, number]) => {
+  const handleTrimChange = (values: [number, number]) => {
     setTrimValues(values)
-
-    if (!audioBuffer || !selectedRange) return
-
-    const startMs = captionsData[selectedRange.start].startMs
-    const endMs = captionsData[selectedRange.end].endMs
-
-    const originalStartTime = startMs / 1000
-    const originalEndTime = endMs / 1000
-    const originalDuration = originalEndTime - originalStartTime
-
-    // Calculate trimmed times based on percentage
-    const trimStartOffset = (values[0] / 100) * originalDuration
-    const trimEndOffset = (values[1] / 100) * originalDuration
-
-    const trimmedStartTime = originalStartTime + trimStartOffset
-    const trimmedEndTime = originalStartTime + trimEndOffset
-
-    const trimmedBuffer = trimAudioBuffer(audioBuffer, trimmedStartTime, trimmedEndTime)
-    const wavBlob = await audioBufferToWav(trimmedBuffer)
-    const url = URL.createObjectURL(wavBlob)
-
-    // Clean up old URL if exists
-    if (subclipUrl) {
-      URL.revokeObjectURL(subclipUrl)
-    }
-
-    setSubclipUrl(url)
+    // Upsert TRIM transform (executes *after* speed in the effect)
+    setTransforms(prev => {
+      const others = prev.filter(t => t.kind !== 'trim')
+      return [...others, { kind: 'trim', startPct: values[0], endPct: values[1] }]
+    })
   }
 
   const clearSelection = () => {
     setSelectionMode(false)
     setSelectedRange(null)
+    setTransforms([])
     if (subclipUrl) {
       URL.revokeObjectURL(subclipUrl)
       setSubclipUrl('')
     }
   }
 
-  const applySpeedAdjustment = async () => {
+  const applySpeedAdjustment = () => {
     if (!audioBuffer || !selectedRange || !subclipSpeedSelection) return
+    const baseStartSec = captionsData[selectedRange.start].startMs / 1000
+    const speedStartIdxGlobal = selectedRange.start + subclipSpeedSelection.start
+    const speedEndIdxGlobal   = selectedRange.start + subclipSpeedSelection.end
+    const speedStartSecLocal  = captionsData[speedStartIdxGlobal].startMs / 1000 - baseStartSec
+    const speedEndSecLocal    = captionsData[speedEndIdxGlobal].endMs   / 1000 - baseStartSec
 
-    try {
-      const audioContext = initAudioContext()
+    // Upsert SPEED transform (runs before TRIM in the effect)
+    setTransforms(prev => {
+      const others = prev.filter(t => t.kind !== 'speed')
+      return [...others, { kind: 'speed', startSec: speedStartSecLocal, endSec: speedEndSecLocal, rate: speedMultiplier }]
+    })
 
-      // Get the original subclip timing
-      const subclipStartMs = captionsData[selectedRange.start].startMs
-      const subclipEndMs = captionsData[selectedRange.end].endMs
-      const subclipStartTime = subclipStartMs / 1000
-      const subclipEndTime = subclipEndMs / 1000
-
-      // Apply trim values
-      const originalDuration = subclipEndTime - subclipStartTime
-      const trimStartOffset = (trimValues[0] / 100) * originalDuration
-      const trimEndOffset = (trimValues[1] / 100) * originalDuration
-      const trimmedStartTime = subclipStartTime + trimStartOffset
-      const trimmedEndTime = subclipStartTime + trimEndOffset
-
-      // Get the speed selection timing within the subclip (global indices for persisted edit)
-      const speedStartIdxGlobal = selectedRange.start + subclipSpeedSelection.start
-      const speedEndIdxGlobal = selectedRange.start + subclipSpeedSelection.end
-      const speedStartMs = captionsData[speedStartIdxGlobal].startMs
-      const speedEndMs = captionsData[speedEndIdxGlobal].endMs
-
-      // Calculate relative positions within the trimmed audio
-      const relativeSpeedStart = Math.max(0, (speedStartMs / 1000 - trimmedStartTime) / (trimmedEndTime - trimmedStartTime))
-      const relativeSpeedEnd = Math.min(1, (speedEndMs / 1000 - trimmedStartTime) / (trimmedEndTime - trimmedStartTime))
-
-      // Create the trimmed buffer
-      const trimmedBuffer = trimAudioBuffer(audioBuffer, trimmedStartTime, trimmedEndTime)
-      const sampleRate = trimmedBuffer.sampleRate
-      const totalSamples = trimmedBuffer.length
-
-      // Calculate sample positions for speed adjustment
-      const speedStartSample = Math.floor(relativeSpeedStart * totalSamples)
-      const speedEndSample = Math.floor(relativeSpeedEnd * totalSamples)
-
-      // Create output buffer with adjusted length
-      const speedAdjustedSamples = Math.floor((speedEndSample - speedStartSample) / speedMultiplier)
-      const newTotalSamples = totalSamples - (speedEndSample - speedStartSample) + speedAdjustedSamples
-
-      const outputBuffer = audioContext.createBuffer(
-        trimmedBuffer.numberOfChannels,
-        newTotalSamples,
-        sampleRate
-      )
-
-      // Process each channel
-      for (let channel = 0; channel < trimmedBuffer.numberOfChannels; channel++) {
-        const inputData = trimmedBuffer.getChannelData(channel)
-        const outputData = outputBuffer.getChannelData(channel)
-
-        let outputPos = 0
-
-        // Copy the part before speed adjustment
-        for (let i = 0; i < speedStartSample; i++) {
-          outputData[outputPos++] = inputData[i]
-        }
-
-        // Apply speed adjustment using simple resampling
-        for (let i = 0; i < speedAdjustedSamples; i++) {
-          const sourcePos = speedStartSample + (i * speedMultiplier)
-          const sourceIndex = Math.floor(sourcePos)
-          const fraction = sourcePos - sourceIndex
-
-          if (sourceIndex < speedEndSample - 1) {
-            // Linear interpolation
-            outputData[outputPos++] = inputData[sourceIndex] * (1 - fraction) + inputData[sourceIndex + 1] * fraction
-          } else if (sourceIndex < speedEndSample) {
-            outputData[outputPos++] = inputData[sourceIndex]
-          }
-        }
-
-        // Copy the part after speed adjustment
-        for (let i = speedEndSample; i < totalSamples; i++) {
-          outputData[outputPos++] = inputData[i]
-        }
-      }
-
-      // Convert to WAV and update subclip
-      const wavBlob = await audioBufferToWav(outputBuffer)
-      const url = URL.createObjectURL(wavBlob)
-
-      // Clean up old URL
-      if (subclipUrl) {
-        URL.revokeObjectURL(subclipUrl)
-      }
-
-      setSubclipUrl(url)
-
-      // Persist edit highlight & allow later clearing
-      setSpeedEdit({ startIdx: speedStartIdxGlobal, endIdx: speedEndIdxGlobal, rate: speedMultiplier })
-      setSubclipSpeedSelection(null) // Clear selection after applying
-
-    } catch (error) {
-      console.error('Error applying speed adjustment:', error)
-      alert('Error applying speed adjustment. Please try again.')
-    }
+    setSpeedEdit({ startIdx: speedStartIdxGlobal, endIdx: speedEndIdxGlobal, rate: speedMultiplier })
+    setSubclipSpeedSelection(null)
   }
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -1279,7 +1239,7 @@ function App() {
                         return (
                           <span
                             key={idx}
-                            onClick={(e) => handleWordClick(e, idx)}
+                            onClick={(e) => !isSpeedEdited ? handleWordClick(e, idx) : undefined}
                             style={{
                               padding: (isActive || isSelected || isSpeedEdited) ? '2px 4px' : 0,
                               backgroundColor: isSelected ? '#90EE90' : (isActive ? '#ffd700' : 'transparent'),
@@ -1294,7 +1254,7 @@ function App() {
                                 : (isActive
                                   ? '0 2px 4px rgba(255, 215, 0, 0.3)'
                                   : (isSelected ? '0 2px 4px rgba(144, 238, 144, 0.3)' : 'none')),
-                              cursor: 'pointer',
+                              cursor: isSpeedEdited ? 'default' : 'pointer',
                               userSelect: 'none',
                               border: isSelectionStart
                                 ? '2px solid green'
@@ -1523,7 +1483,7 @@ function App() {
                   Speed edit: words {speedEdit.startIdx + 1}-{speedEdit.endIdx + 1} at {speedEdit.rate}x
                 </span>
                 <button
-                  onClick={() => setSpeedEdit(null)}
+                  onClick={() => { setSpeedEdit(null); setTransforms(prev => prev.filter(t => t.kind !== 'speed')) }}
                   style={{
                     padding: '0.35rem 0.75rem',
                     backgroundColor: '#ef5350',
@@ -1678,6 +1638,50 @@ function App() {
                   </div>
                 </div>
 
+                {/* Applied Transformations */}
+                {speedEdit && (
+                  <div style={{
+                    padding: '1rem',
+                    backgroundColor: '#f8f9fa',
+                    borderRadius: '4px',
+                    border: '1px solid #dee2e6'
+                  }}>
+                    <h3 style={{ margin: '0 0 1rem 0', color: '#333' }}>Applied Transformations</h3>
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '0.75rem',
+                      backgroundColor: '#e3f2fd',
+                      border: '1px solid #90caf9',
+                      borderRadius: '4px'
+                    }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                        <span style={{ fontSize: '1em', fontWeight: 'bold', color: '#1976d2' }}>
+                          Speed Adjustment: {speedEdit.rate}x
+                        </span>
+                        <span style={{ fontSize: '0.9em', color: '#666' }}>
+                          Applied to words {speedEdit.startIdx + 1}-{speedEdit.endIdx + 1}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => { setSpeedEdit(null); setTransforms(prev => prev.filter(t => t.kind !== 'speed')) }}
+                        style={{
+                          padding: '0.5rem 1rem',
+                          backgroundColor: '#dc3545',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          fontSize: '0.9em'
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {/* Speed Controls */}
                 <div style={{
                   padding: '1rem',
@@ -1739,7 +1743,7 @@ function App() {
                       return (
                         <span
                           key={globalIdx}
-                          onClick={() => {
+                          onClick={!isPersisted ? () => {
                             if (!subclipSpeedSelection) {
                               setSubclipSpeedSelection({ start: i, end: i })
                             } else {
@@ -1747,13 +1751,13 @@ function App() {
                               const end = Math.max(subclipSpeedSelection.start, i)
                               setSubclipSpeedSelection({ start, end })
                             }
-                          }}
+                          } : undefined}
                           style={{
                             padding: (isInSpeedSelection || isPersisted) ? '2px 4px' : 0,
                             backgroundColor: isInSpeedSelection ? '#ffeb3b' : (isPersisted ? '#e3f2fd' : 'transparent'),
                             outline: isPersisted ? '2px solid #2196f3' : 'none',
                             borderRadius: (isInSpeedSelection || isPersisted) ? 3 : 0,
-                            cursor: 'pointer',
+                            cursor: isPersisted ? 'default' : 'pointer',
                             userSelect: 'none',
                             border: isSpeedSelectionStart
                               ? '2px solid #2196f3'
@@ -1799,7 +1803,7 @@ function App() {
                       </button>
                       {speedEdit && (
                         <button
-                          onClick={() => setSpeedEdit(null)}
+                          onClick={() => { setSpeedEdit(null); setTransforms(prev => prev.filter(t => t.kind !== 'speed')) }}
                           style={{
                             padding: '0.5rem 1rem',
                             backgroundColor: '#ef5350',
