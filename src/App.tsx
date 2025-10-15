@@ -190,6 +190,20 @@ function App() {
 
   // Detail view subclip modal state
   const [showDetailView, setShowDetailView] = useState(false)
+
+  // Prevent body scroll when modal is open
+  useEffect(() => {
+    if (showDetailView) {
+      document.body.style.overflow = 'hidden'
+    } else {
+      document.body.style.overflow = ''
+    }
+
+    // Cleanup on unmount
+    return () => {
+      document.body.style.overflow = ''
+    }
+  }, [showDetailView])
   const [subclipSpeedSelection, setSubclipSpeedSelection] = useState<{start: number, end: number} | null>(null)
   const [speedMultiplier, setSpeedMultiplier] = useState(1.0)
   const [speedEdits, setSpeedEdits] = useState<SpeedEdit[]>([])
@@ -1727,7 +1741,9 @@ function App() {
                 display: 'flex',
                 flexDirection: 'column',
                 padding: '1rem',
-                gap: '1rem'
+                gap: '1rem',
+                minHeight: 0,
+                overflow: 'hidden'
               }}>
                 {/* Audio Controls */}
                 <div style={{
