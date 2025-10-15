@@ -1,8 +1,10 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useMemo, useEffect } from 'react'
 import { transcribe, canUseWhisperWeb, resampleTo16Khz, downloadWhisperModel, toCaptions } from '@remotion/whisper-web'
 import ReactSlider from 'react-slider'
 import { useDropzone } from 'react-dropzone'
 import localforage from 'localforage'
+import { Virtuoso  } from 'react-virtuoso'
+import type { VirtuosoHandle } from 'react-virtuoso'
 import './App.css'
 
 // Cache storage interface
@@ -16,6 +18,9 @@ interface CachedTranscript {
   modelUsed: string
   captions: Array<{text: string, startMs: number, endMs: number, confidence: number | null}>
 }
+
+// Stronger caption type for local use
+type Caption = { text: string; startMs: number; endMs: number; confidence: number | null }
 
 // Generate SHA-256 hash of file content
 async function hashFile(file: File): Promise<string> {
@@ -41,6 +46,30 @@ function formatTime(seconds: number): string {
   }
 }
 
+// Group consecutive words into chunks so each chunk becomes ONE virtual row.
+function chunkCaptions(
+  caps: Caption[],
+  maxWords = 80,
+  maxGapMs = 900
+) {
+  const chunks: { start: number; end: number; startMs: number; endMs: number }[] = []
+  if (!caps.length) return chunks
+  let start = 0
+  for (let i = 1; i < caps.length; i++) {
+    const tooMany = i - start >= maxWords
+    const gap = caps[i].startMs - caps[i - 1].endMs
+    if (tooMany || gap > maxGapMs) {
+      chunks.push({
+        start, end: i - 1,
+        startMs: caps[start].startMs, endMs: caps[i - 1].endMs
+      })
+      start = i
+    }
+  }
+  chunks.push({ start, end: caps.length - 1, startMs: caps[start].startMs, endMs: caps[caps.length - 1].endMs })
+  return chunks
+}
+
 function App() {
   const [status, setStatus] = useState<string>('Ready to transcribe')
   const [transcription, setTranscription] = useState<string>('')
@@ -52,7 +81,7 @@ function App() {
   const [debugChunks, setDebugChunks] = useState(1)
   const [audioUrl, setAudioUrl] = useState<string>('')
   const [currentTime, setCurrentTime] = useState(0)
-  const [captionsData, setCaptionsData] = useState<Array<{text: string, startMs: number, endMs: number, confidence: number | null}>>([])
+  const [captionsData, setCaptionsData] = useState<Caption[]>([])
   const [activeCaptionIndex, setActiveCaptionIndex] = useState<number>(-1)
   const [selectionMode, setSelectionMode] = useState(false)
   const [selectedRange, setSelectedRange] = useState<{start: number, end: number} | null>(null)
@@ -65,6 +94,27 @@ function App() {
   const audioRef = useRef<HTMLAudioElement>(null)
   const subclipAudioRef = useRef<HTMLAudioElement>(null)
   const startTimeRef = useRef<number>(0)
+  const virtuosoRef = useRef<VirtuosoHandle>(null)
+
+  // Build chunks for virtualization (one chunk = one row).
+  const { chunks, wordToChunk } = useMemo(() => {
+    const cs = chunkCaptions(captionsData, 80, 900)
+    const map: number[] = new Array(captionsData.length)
+    cs.forEach((c, idx) => { for (let i = c.start; i <= c.end; i++) map[i] = idx })
+    return { chunks: cs, wordToChunk: map }
+  }, [captionsData])
+
+  // Auto-scroll to the active word's chunk
+  useEffect(() => {
+    if (activeCaptionIndex >= 0) {
+      const chunkIdx = wordToChunk[activeCaptionIndex]
+      if (chunkIdx != null) {
+        virtuosoRef.current?.scrollToIndex({
+          index: chunkIdx, align: 'center', behavior: 'auto'
+        })
+      }
+    }
+  }, [activeCaptionIndex, wordToChunk])
 
   // Simple, phase-aware progress + ETA (no 10/90 guessing)
   const NUM_PHASES = 2 // 0: resample, 1: transcribe
@@ -758,29 +808,30 @@ function App() {
         )}
 
         {captionsData.length > 0 && (
-          <div style={{
-            padding: '1rem',
-            backgroundColor: '#f8f9fa',
-            border: '1px solid #dee2e6',
-            borderRadius: '4px',
-            maxHeight: '400px',
-            overflowY: 'auto',
-            marginBottom: '2rem'
-          }}>
+          <div
+            style={{
+              padding: '1rem',
+              backgroundColor: '#f8f9fa',
+              border: '1px solid #dee2e6',
+              borderRadius: '4px',
+              height: 400,
+              marginBottom: '2rem',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.5rem'
+            }}
+          >
             {selectionMode && (
-              <div style={{
-                marginBottom: '1rem',
-                padding: '0.5rem',
-                backgroundColor: '#fffacd',
-                borderRadius: '4px',
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                position: 'sticky',
-                top: '10px',
-                zIndex: 10,
-                boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
-              }}>
+              <div
+                style={{
+                  padding: '0.5rem',
+                  backgroundColor: '#fffacd',
+                  borderRadius: '4px',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center'
+                }}
+              >
                 <span style={{ color: '#666' }}>
                   Selection mode active - click another caption to select range
                 </span>
@@ -799,47 +850,69 @@ function App() {
                 </button>
               </div>
             )}
-            <p style={{
-              lineHeight: '1.8',
-              fontSize: '1.1em',
-              color: '#333',
-              margin: 0
-            }}>
-              {captionsData.map((caption, index) => {
-                const isActive = index === activeCaptionIndex
-                const isSelected = selectedRange && index >= selectedRange.start && index <= selectedRange.end
-                const isSelectionStart = selectedRange && index === selectedRange.start
-                const isSelectionEnd = selectedRange && index === selectedRange.end
-
-                return (
-                  <span
-                    key={index}
-                    onClick={() => handleCaptionClick(index)}
-                    style={{
-                      padding: isActive || isSelected ? '2px 4px' : '0',
-                      backgroundColor: isSelected ? '#90EE90' : (isActive ? '#ffd700' : 'transparent'),
-                      borderRadius: (isActive || isSelected) ? '3px' : '0',
-                      transition: 'all 0.3s ease',
-                      color: (isActive || isSelected) ? '#000' : '#333',
-                      fontWeight: (isActive || isSelected) ? 'bold' : 'normal',
-                      borderBottom: '1px solid #e0e0e0',
-                      boxShadow: isActive ? '0 2px 4px rgba(255, 215, 0, 0.3)' : (isSelected ? '0 2px 4px rgba(144, 238, 144, 0.3)' : 'none'),
-                      cursor: 'pointer',
-                      userSelect: 'none',
-                      border: isSelectionStart ? '2px solid green' : (isSelectionEnd ? '2px solid red' : 'none'),
-                      textDecoration: 'underline',
-                      textDecorationColor: '#999',
-                      textDecorationThickness: '1px'
-                    }}
-                  >
-                    {caption.text}
-                  </span>
-                )
-              }).reduce<React.ReactNode[]>((acc, curr, index) => {
-                if (index === 0) return [curr]
-                return [...acc, ' ', curr]
-              }, [])}
-            </p>
+            <div style={{ flex: 1 }}>
+              <Virtuoso
+                ref={virtuosoRef}
+                totalCount={chunks.length}
+                overscan={300}
+                style={{ height: '100%' }}
+                itemContent={(chunkIdx) => {
+                  const ch = chunks[chunkIdx]
+                  const slice = captionsData.slice(ch.start, ch.end + 1)
+                  return (
+                    <p
+                      style={{
+                        margin: '8px 12px',
+                        lineHeight: 1.8,
+                        fontSize: '1.1em',
+                        color: '#333',
+                        whiteSpace: 'normal',
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {slice.map((c, i) => {
+                        const idx = ch.start + i
+                        const isActive = idx === activeCaptionIndex
+                        const isSelected =
+                          selectedRange && idx >= selectedRange.start && idx <= selectedRange.end
+                        const isSelectionStart = selectedRange && idx === selectedRange.start
+                        const isSelectionEnd = selectedRange && idx === selectedRange.end
+                        return (
+                          <span
+                            key={idx}
+                            onClick={() => handleCaptionClick(idx)}
+                            style={{
+                              padding: (isActive || isSelected) ? '2px 4px' : 0,
+                              backgroundColor: isSelected ? '#90EE90' : (isActive ? '#ffd700' : 'transparent'),
+                              borderRadius: (isActive || isSelected) ? 3 : 0,
+                              transition: 'all 0.3s ease',
+                              color: (isActive || isSelected) ? '#000' : '#333',
+                              fontWeight: (isActive || isSelected) ? 'bold' : 'normal',
+                              borderBottom: '1px solid #e0e0e0',
+                              boxShadow: isActive
+                                ? '0 2px 4px rgba(255, 215, 0, 0.3)'
+                                : (isSelected ? '0 2px 4px rgba(144, 238, 144, 0.3)' : 'none'),
+                              cursor: 'pointer',
+                              userSelect: 'none',
+                              border: isSelectionStart
+                                ? '2px solid green'
+                                : (isSelectionEnd ? '2px solid red' : 'none'),
+                              textDecoration: 'underline',
+                              textDecorationColor: '#999',
+                              textDecorationThickness: '1px',
+                              marginRight: 4
+                            }}
+                            title={`${(c.startMs/1000).toFixed(2)}s → ${(c.endMs/1000).toFixed(2)}s`}
+                          >
+                            {c.text}
+                          </span>
+                        )
+                      })}
+                    </p>
+                  )
+                }}
+              />
+            </div>
           </div>
         )}
 
