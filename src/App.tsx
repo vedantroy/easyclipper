@@ -1794,16 +1794,16 @@ function App() {
                   </div>
                 </div>
 
-                {/* Applied Transformations */}
+                {/* Applied Transformations - Compact */}
                 {speedEdits.length > 0 && (
                   <div style={{
-                    padding: '1rem',
+                    padding: '0.5rem',
                     backgroundColor: '#f8f9fa',
                     borderRadius: '4px',
                     border: '1px solid #dee2e6'
                   }}>
-                    <h3 style={{ margin: '0 0 1rem 0', color: '#333' }}>Applied Transformations</h3>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    <div style={{ fontSize: '0.9em', fontWeight: 'bold', marginBottom: '0.5rem', color: '#333' }}>Applied Speed Edits</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', maxHeight: '120px', overflow: 'auto' }}>
                       {speedEdits.map(edit => {
                         const relativeStart = edit.startIdx - selectedRange.start + 1
                         const relativeEnd = edit.endIdx - selectedRange.start + 1
@@ -1814,20 +1814,16 @@ function App() {
                               display: 'flex',
                               alignItems: 'center',
                               justifyContent: 'space-between',
-                              padding: '0.75rem',
+                              padding: '0.25rem 0.5rem',
                               backgroundColor: '#e3f2fd',
                               border: '1px solid #90caf9',
-                              borderRadius: '4px'
+                              borderRadius: '4px',
+                              fontSize: '0.85em'
                             }}
                           >
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
-                              <span style={{ fontSize: '1em', fontWeight: 'bold', color: '#1976d2' }}>
-                                Speed Adjustment: {edit.rate}x
-                              </span>
-                              <span style={{ fontSize: '0.9em', color: '#666' }}>
-                                Applied to words {relativeStart}-{relativeEnd}
-                              </span>
-                            </div>
+                            <span style={{ color: '#1976d2' }}>
+                              {edit.rate}x: words {relativeStart}-{relativeEnd}
+                            </span>
                             <button
                               onClick={() => {
                                 setSpeedEdits(prev => prev.filter(e => e.id !== edit.id))
@@ -1846,16 +1842,16 @@ function App() {
                                 })
                               }}
                               style={{
-                                padding: '0.5rem 1rem',
+                                padding: '0.2rem 0.4rem',
                                 backgroundColor: '#dc3545',
                                 color: 'white',
                                 border: 'none',
-                                borderRadius: '4px',
+                                borderRadius: '3px',
                                 cursor: 'pointer',
-                                fontSize: '0.9em'
+                                fontSize: '0.8em'
                               }}
                             >
-                              Delete
+                              ×
                             </button>
                           </div>
                         )
@@ -1864,57 +1860,99 @@ function App() {
                   </div>
                 )}
 
-                {/* Speed Controls */}
+                {/* Speed Controls - Compact with inline apply */}
                 <div style={{
-                  padding: '1rem',
+                  padding: '0.5rem',
                   backgroundColor: '#f0f8ff',
                   borderRadius: '4px',
                   border: '1px solid #cce7ff'
                 }}>
-                  <h3 style={{ margin: '0 0 1rem 0', color: '#333' }}>Speed Control</h3>
-                  <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '1rem' }}>
-                    <span style={{ color: '#666' }}>Speed:</span>
+                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: '0.9em', fontWeight: 'bold', color: '#333' }}>Speed:</span>
                     {[1.0, 1.5, 2.0, 3.0, 4.0].map(speed => (
                       <button
                         key={speed}
                         onClick={() => setSpeedMultiplier(speed)}
                         style={{
-                          padding: '0.5rem 1rem',
+                          padding: '0.3rem 0.6rem',
                           backgroundColor: speedMultiplier === speed ? '#2196f3' : '#fff',
                           color: speedMultiplier === speed ? 'white' : '#333',
                           border: '1px solid #2196f3',
                           borderRadius: '4px',
-                          cursor: 'pointer'
+                          cursor: 'pointer',
+                          fontSize: '0.85em'
                         }}
                       >
                         {speed}x
                       </button>
                     ))}
+                    {subclipSpeedSelection && (
+                      <>
+                        <span style={{ color: '#666', fontSize: '0.85em', marginLeft: 'auto' }}>
+                          Selected: {subclipSpeedSelection.start + 1}-{subclipSpeedSelection.end + 1}
+                        </span>
+                        <button
+                          onClick={applySpeedAdjustment}
+                          style={{
+                            padding: '0.3rem 0.8rem',
+                            backgroundColor: '#28a745',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '4px',
+                            cursor: 'pointer',
+                            fontSize: '0.85em',
+                            fontWeight: 'bold'
+                          }}
+                        >
+                          Apply {speedMultiplier}x
+                        </button>
+                        <button
+                          onClick={() => setSubclipSpeedSelection(null)}
+                          style={{
+                            padding: '0.3rem 0.6rem',
+                            backgroundColor: '#6c757d',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '4px',
+                            cursor: 'pointer',
+                            fontSize: '0.85em'
+                          }}
+                        >
+                          Clear
+                        </button>
+                      </>
+                    )}
                   </div>
-
-                  {subclipSpeedSelection && (
-                    <div style={{ color: '#666', fontSize: '0.9em' }}>
-                      Speed selection: Words {subclipSpeedSelection.start + 1}-{subclipSpeedSelection.end + 1} at {speedMultiplier}x
-                    </div>
-                  )}
                 </div>
 
-                {/* Subclip Words */}
+                {/* Subclip Words - Fixed scrolling */}
                 <div style={{
                   flex: 1,
                   border: '1px solid #ddd',
                   borderRadius: '4px',
-                  padding: '1rem',
-                  overflow: 'auto',
-                  maxHeight: '400px'
+                  display: 'flex',
+                  flexDirection: 'column',
+                  minHeight: 0
                 }}>
-                  <h3 style={{ margin: '0 0 1rem 0', color: '#333' }}>
-                    Words in Subclip (Select range for speed adjustment)
-                  </h3>
                   <div style={{
-                    lineHeight: 1.8,
-                    fontSize: '1.1em'
+                    padding: '0.5rem',
+                    borderBottom: '1px solid #ddd',
+                    fontSize: '0.9em',
+                    fontWeight: 'bold',
+                    color: '#333',
+                    flexShrink: 0
                   }}>
+                    Words in Subclip (Click to select range for speed adjustment)
+                  </div>
+                  <div style={{
+                    flex: 1,
+                    overflow: 'auto',
+                    padding: '0.75rem'
+                  }}>
+                    <div style={{
+                      lineHeight: 1.8,
+                      fontSize: '1.1em'
+                    }}>
                     {captionsData.slice(selectedRange.start, selectedRange.end + 1).map((caption, i) => {
                       const globalIdx = selectedRange.start + i
                       const isInSpeedSelection = subclipSpeedSelection &&
@@ -1957,54 +1995,31 @@ function App() {
                         </span>
                       )
                     })}
+                    </div>
                   </div>
-
-                  {subclipSpeedSelection && (
-                    <div style={{ marginTop: '1rem', display: 'flex', gap: '1rem' }}>
+                  {speedEdits.length > 0 && (
+                    <div style={{
+                      padding: '0.5rem',
+                      borderTop: '1px solid #ddd',
+                      flexShrink: 0
+                    }}>
                       <button
-                        onClick={() => setSubclipSpeedSelection(null)}
+                        onClick={() => {
+                          setSpeedEdits([])
+                          setTransforms(prev => prev.filter(t => t.kind !== 'speed'))
+                        }}
                         style={{
-                          padding: '0.5rem 1rem',
-                          backgroundColor: '#dc3545',
+                          padding: '0.3rem 0.8rem',
+                          backgroundColor: '#ef5350',
                           color: 'white',
                           border: 'none',
                           borderRadius: '4px',
-                          cursor: 'pointer'
+                          cursor: 'pointer',
+                          fontSize: '0.85em'
                         }}
                       >
-                        Clear Selection
+                        Clear All Speed Edits
                       </button>
-                      <button
-                        onClick={applySpeedAdjustment}
-                        style={{
-                          padding: '0.5rem 1rem',
-                          backgroundColor: '#28a745',
-                          color: 'white',
-                          border: 'none',
-                          borderRadius: '4px',
-                          cursor: 'pointer'
-                        }}
-                      >
-                        Apply {speedMultiplier}x Speed
-                      </button>
-                      {speedEdits.length > 0 && (
-                        <button
-                          onClick={() => {
-                            setSpeedEdits([])
-                            setTransforms(prev => prev.filter(t => t.kind !== 'speed'))
-                          }}
-                          style={{
-                            padding: '0.5rem 1rem',
-                            backgroundColor: '#ef5350',
-                            color: 'white',
-                            border: 'none',
-                            borderRadius: '4px',
-                            cursor: 'pointer'
-                          }}
-                        >
-                          Clear All Speed Edits
-                        </button>
-                      )}
                     </div>
                   )}
                 </div>
