@@ -5,6 +5,7 @@ import { useDropzone } from 'react-dropzone'
 import localforage from 'localforage'
 import { Virtuoso  } from 'react-virtuoso'
 import type { VirtuosoHandle } from 'react-virtuoso'
+// import { SoundTouch, SimpleFilter } from 'soundtouchjs'
 import './App.css'
 
 // Cache storage interface
@@ -415,50 +416,179 @@ function App() {
   }
 
   // 3) rewrite the resampler (fix rounding & edge handling)
-  const applySpeedSegment = (buffer: AudioBuffer, xf: SpeedXform): AudioBuffer => {
-    const ctx = initAudioContext()
-    const r = Number.isFinite(xf.rate) && xf.rate > 0 ? xf.rate : 1
+  // const applySpeedSegment = (buffer: AudioBuffer, xf: SpeedXform): AudioBuffer => {
+  //   const ctx = initAudioContext()
+  //   const r = Number.isFinite(xf.rate) && xf.rate > 0 ? xf.rate : 1
 
+  //   const sr = buffer.sampleRate
+  //   const startSample = clamp(Math.floor(xf.startSec * sr), 0, buffer.length)
+  //   const endSample   = clamp(Math.floor(xf.endSec   * sr), startSample, buffer.length)
+
+  //   // nothing to change, copy-through
+  //   if (r === 1 || endSample <= startSample) return buffer
+
+  //   const preLen    = startSample
+  //   const segLenIn  = endSample - startSample
+  //   const segLenOut = Math.max(1, Math.round(segLenIn / r)) // <- floor caused drift & "collapsed" tiny regions
+  //   const postLen   = buffer.length - endSample
+  //   const outLen    = preLen + segLenOut + postLen
+
+  //   const out = ctx.createBuffer(buffer.numberOfChannels, outLen, sr)
+
+  //   for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+  //     const src = buffer.getChannelData(ch)
+  //     const dst = out.getChannelData(ch)
+
+  //     // 3a) pre
+  //     dst.set(src.subarray(0, preLen), 0)
+
+  //     // 3b) resample segment with linear interpolation
+  //     // map output index -> input position inside [startSample, endSample)
+  //     // using exact ratio to avoid cumulative error
+  //     const base = preLen
+  //     for (let i = 0; i < segLenOut; i++) {
+  //       const pos = startSample + (i * segLenIn) / segLenOut // <- was i * rate; this eliminates rounding error
+  //       const idx = Math.floor(pos)
+  //       const frac = pos - idx
+  //       const i0 = clamp(idx, 0, endSample - 1)
+  //       const i1 = clamp(idx + 1, 0, endSample - 1)
+  //       dst[base + i] = src[i0] * (1 - frac) + src[i1] * frac
+  //     }
+
+  //     // 3c) post
+  //     dst.set(src.subarray(endSample), preLen + segLenOut)
+  //   }
+
+  //   return out
+  // }
+
+  // WSOLA-based time stretching with proper sectioning
+  const applySpeedSegment = (buffer: AudioBuffer, xf: SpeedXform): AudioBuffer => {
+    const rate = Number.isFinite(xf.rate) && xf.rate > 0 ? xf.rate : 1
     const sr = buffer.sampleRate
     const startSample = clamp(Math.floor(xf.startSec * sr), 0, buffer.length)
-    const endSample   = clamp(Math.floor(xf.endSec   * sr), startSample, buffer.length)
+    const endSample = clamp(Math.floor(xf.endSec * sr), startSample, buffer.length)
 
-    // nothing to change, copy-through
-    if (r === 1 || endSample <= startSample) return buffer
+    // No change needed
+    if (rate === 1 || endSample <= startSample) return buffer
 
-    const preLen    = startSample
-    const segLenIn  = endSample - startSample
-    const segLenOut = Math.max(1, Math.round(segLenIn / r)) // <- floor caused drift & "collapsed" tiny regions
-    const postLen   = buffer.length - endSample
-    const outLen    = preLen + segLenOut + postLen
+    const ctx = initAudioContext()
 
-    const out = ctx.createBuffer(buffer.numberOfChannels, outLen, sr)
+    // Process each channel
+    const outputChannels: Float32Array[] = []
 
     for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
-      const src = buffer.getChannelData(ch)
-      const dst = out.getChannelData(ch)
+      const channelData = buffer.getChannelData(ch)
 
-      // 3a) pre
-      dst.set(src.subarray(0, preLen), 0)
+      // Split into three sections: before, middle (to be sped up), after
+      const before = channelData.slice(0, startSample)
+      const middle = channelData.slice(startSample, endSample)
+      const after = channelData.slice(endSample)
 
-      // 3b) resample segment with linear interpolation
-      // map output index -> input position inside [startSample, endSample)
-      // using exact ratio to avoid cumulative error
-      const base = preLen
-      for (let i = 0; i < segLenOut; i++) {
-        const pos = startSample + (i * segLenIn) / segLenOut // <- was i * rate; this eliminates rounding error
-        const idx = Math.floor(pos)
-        const frac = pos - idx
-        const i0 = clamp(idx, 0, endSample - 1)
-        const i1 = clamp(idx + 1, 0, endSample - 1)
-        dst[base + i] = src[i0] * (1 - frac) + src[i1] * frac
-      }
+      // Process middle section with WSOLA
+      const processedMiddle = timeStretchWSEW(middle, rate, sr)
 
-      // 3c) post
-      dst.set(src.subarray(endSample), preLen + segLenOut)
+      // Concatenate all three sections
+      const outputChannel = new Float32Array(before.length + processedMiddle.length + after.length)
+      outputChannel.set(before, 0)
+      outputChannel.set(processedMiddle, before.length)
+      outputChannel.set(after, before.length + processedMiddle.length)
+
+      outputChannels.push(outputChannel)
     }
 
-    return out
+    // Create output buffer with concatenated sections
+    const outputBuffer = ctx.createBuffer(
+      buffer.numberOfChannels,
+      outputChannels[0].length,
+      sr
+    )
+
+    for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+      outputBuffer.getChannelData(ch).set(outputChannels[ch])
+    }
+
+    return outputBuffer
+  }
+
+  // WSOLA (Waveform Similarity Overlap-Add) time stretching
+  const timeStretchWSEW = (input: Float32Array, rate: number, sampleRate: number): Float32Array => {
+    // Window size and hop size in samples
+    const windowMs = 30 // Window size in milliseconds
+    const windowSize = Math.round((windowMs / 1000) * sampleRate)
+    const hopSize = Math.round(windowSize / 2)
+    const searchRange = Math.round(windowSize / 4)
+
+    // Calculate output length
+    const outputLength = Math.round(input.length / rate)
+    const output = new Float32Array(outputLength)
+
+    let inputPos = 0
+    let outputPos = 0
+
+    // Copy first window directly
+    const firstWindow = Math.min(windowSize, input.length, outputLength)
+    for (let i = 0; i < firstWindow; i++) {
+      output[i] = input[i]
+    }
+    outputPos = hopSize
+    inputPos = Math.round(hopSize * rate)
+
+    // Process remaining audio
+    while (outputPos < outputLength - windowSize && inputPos < input.length - windowSize) {
+      // Find best matching position in search range
+      let bestOffset = 0
+      let bestCorr = -Infinity
+
+      const searchStart = Math.max(0, inputPos - searchRange)
+      const searchEnd = Math.min(input.length - windowSize, inputPos + searchRange)
+
+      // Find best correlation point
+      for (let offset = searchStart; offset <= searchEnd; offset++) {
+        let corr = 0
+        const overlapSize = Math.min(hopSize, input.length - offset, outputLength - outputPos)
+
+        for (let i = 0; i < overlapSize; i++) {
+          corr += input[offset + i] * output[outputPos - hopSize + i]
+        }
+
+        if (corr > bestCorr) {
+          bestCorr = corr
+          bestOffset = offset
+        }
+      }
+
+      // Overlap-add the best matching window
+      const overlapSize = Math.min(hopSize, input.length - bestOffset, outputLength - outputPos)
+
+      // Crossfade overlap region
+      for (let i = 0; i < overlapSize; i++) {
+        const fade = i / overlapSize
+        output[outputPos + i] = output[outputPos + i] * (1 - fade) + input[bestOffset + i] * fade
+      }
+
+      // Copy non-overlapping part
+      const copySize = Math.min(hopSize, input.length - bestOffset - overlapSize, outputLength - outputPos - overlapSize)
+      for (let i = 0; i < copySize; i++) {
+        output[outputPos + overlapSize + i] = input[bestOffset + overlapSize + i]
+      }
+
+      // Update positions
+      outputPos += hopSize
+      inputPos = Math.round(outputPos * rate)
+    }
+
+    // Handle remaining samples
+    const remaining = Math.min(input.length - inputPos, outputLength - outputPos)
+    if (remaining > 0 && outputPos < outputLength && inputPos < input.length) {
+      for (let i = 0; i < remaining; i++) {
+        if (outputPos + i < outputLength && inputPos + i < input.length) {
+          output[outputPos + i] = input[inputPos + i]
+        }
+      }
+    }
+
+    return output
   }
 
   // 2) make the mapping robust (base-time -> post-speed time)
