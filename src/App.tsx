@@ -204,6 +204,11 @@ function App() {
   const isIdxInSpeedEdit = (idx: number) =>
     !!(speedEdit && idx >= speedEdit.startIdx && idx <= speedEdit.endIdx)
 
+  // --- fixes ---
+  // 1) safer time helpers
+  const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
+  const ensureAscending = (a: number, b: number) => [Math.min(a, b), Math.max(a, b)] as const
+
   // Build chunks for virtualization (one chunk = one row).
   const { chunks, wordToChunk } = useMemo(() => {
     const cs = chunkCaptionsSimple(captionsData, 400, 1200) // Use sentence-based chunking
@@ -317,8 +322,7 @@ function App() {
     setActiveMatch(matches.length > 0 ? 0 : -1)
   }, [matches])
 
-  // --- Compose & render pipeline (speed then trim) ---
-  // Recompute subclipUrl whenever selection, audio, or transforms change
+  // 4) keep the UI duration in sync with transforms (users thought "speed" did nothing)
   useEffect(() => {
     const render = async () => {
       if (!audioBuffer || !selectedRange) return
@@ -337,8 +341,12 @@ function App() {
         const t1Base = (trim.endPct   / 100) * baseDur
         const t0 = speed ? mapTimeThroughSpeed(t0Base, speed) : t0Base
         const t1 = speed ? mapTimeThroughSpeed(t1Base, speed) : t1Base
-        cur = trimAudioBuffer(cur, t0, t1)
+        const [tStart, tEnd] = ensureAscending(t0, t1)
+        cur = trimAudioBuffer(cur, tStart, tEnd)
       }
+
+      // NEW: reflect the *current* duration (after speed/trim) so the trim readout is correct
+      setSubclipDuration(cur.duration)
 
       const wav = await audioBufferToWav(cur)
       const url = URL.createObjectURL(wav)
@@ -406,41 +414,58 @@ function App() {
     return trimmedBuffer
   }
 
-  // Apply a speed change to [startSec, endSec] within `buffer`
+  // 3) rewrite the resampler (fix rounding & edge handling)
   const applySpeedSegment = (buffer: AudioBuffer, xf: SpeedXform): AudioBuffer => {
     const ctx = initAudioContext()
-    const { startSec, endSec, rate } = xf
-    const sampleRate = buffer.sampleRate
-    const startSample = Math.max(0, Math.floor(startSec * sampleRate))
-    const endSample   = Math.min(buffer.length, Math.floor(endSec * sampleRate))
-    const preLen      = startSample
-    const segLen      = Math.max(0, endSample - startSample)
-    const segOutLen   = Math.floor(segLen / Math.max(0.0001, rate))
-    const outLen      = preLen + segOutLen + (buffer.length - endSample)
-    const out = ctx.createBuffer(buffer.numberOfChannels, outLen, sampleRate)
+    const r = Number.isFinite(xf.rate) && xf.rate > 0 ? xf.rate : 1
+
+    const sr = buffer.sampleRate
+    const startSample = clamp(Math.floor(xf.startSec * sr), 0, buffer.length)
+    const endSample   = clamp(Math.floor(xf.endSec   * sr), startSample, buffer.length)
+
+    // nothing to change, copy-through
+    if (r === 1 || endSample <= startSample) return buffer
+
+    const preLen    = startSample
+    const segLenIn  = endSample - startSample
+    const segLenOut = Math.max(1, Math.round(segLenIn / r)) // <- floor caused drift & "collapsed" tiny regions
+    const postLen   = buffer.length - endSample
+    const outLen    = preLen + segLenOut + postLen
+
+    const out = ctx.createBuffer(buffer.numberOfChannels, outLen, sr)
+
     for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
-      const inCh  = buffer.getChannelData(ch)
-      const outCh = out.getChannelData(ch)
-      let o = 0
-      // copy pre
-      for (let i = 0; i < preLen; i++) outCh[o++] = inCh[i]
-      // resample segment (linear)
-      for (let i = 0; i < segOutLen; i++) {
-        const pos = startSample + i * rate
+      const src = buffer.getChannelData(ch)
+      const dst = out.getChannelData(ch)
+
+      // 3a) pre
+      dst.set(src.subarray(0, preLen), 0)
+
+      // 3b) resample segment with linear interpolation
+      // map output index -> input position inside [startSample, endSample)
+      // using exact ratio to avoid cumulative error
+      const base = preLen
+      for (let i = 0; i < segLenOut; i++) {
+        const pos = startSample + (i * segLenIn) / segLenOut // <- was i * rate; this eliminates rounding error
         const idx = Math.floor(pos)
         const frac = pos - idx
-        if (idx < endSample - 1) outCh[o++] = inCh[idx]*(1-frac) + inCh[idx+1]*frac
-        else outCh[o++] = inCh[Math.min(idx, endSample-1)]
+        const i0 = clamp(idx, 0, endSample - 1)
+        const i1 = clamp(idx + 1, 0, endSample - 1)
+        dst[base + i] = src[i0] * (1 - frac) + src[i1] * frac
       }
-      // copy post
-      for (let i = endSample; i < buffer.length; i++) outCh[o++] = inCh[i]
+
+      // 3c) post
+      dst.set(src.subarray(endSample), preLen + segLenOut)
     }
+
     return out
   }
 
-  // Map a time (in seconds) through a speed segment (used so TRIM runs *after* speed)
+  // 2) make the mapping robust (base-time -> post-speed time)
   const mapTimeThroughSpeed = (t: number, s: SpeedXform) => {
-    const { startSec: a, endSec: b, rate: r } = s
+    let { startSec: a, endSec: b, rate: r } = s
+    r = Number.isFinite(r) && r > 0 ? r : 1
+    ;[a, b] = ensureAscending(a, b)
     if (t <= a) return t
     if (t <= b) return a + (t - a) / r
     return a + (b - a) / r + (t - b)
@@ -592,18 +617,17 @@ function App() {
   const applySpeedAdjustment = () => {
     if (!audioBuffer || !selectedRange || !subclipSpeedSelection) return
     const baseStartSec = captionsData[selectedRange.start].startMs / 1000
-    const speedStartIdxGlobal = selectedRange.start + subclipSpeedSelection.start
-    const speedEndIdxGlobal   = selectedRange.start + subclipSpeedSelection.end
-    const speedStartSecLocal  = captionsData[speedStartIdxGlobal].startMs / 1000 - baseStartSec
-    const speedEndSecLocal    = captionsData[speedEndIdxGlobal].endMs   / 1000 - baseStartSec
+    const startIdx = selectedRange.start + subclipSpeedSelection.start
+    const endIdx   = selectedRange.start + subclipSpeedSelection.end
+    const startSecLocal = Math.max(0, captionsData[startIdx].startMs / 1000 - baseStartSec)
+    const endSecLocal   = Math.max(startSecLocal, captionsData[endIdx].endMs   / 1000 - baseStartSec)
 
-    // Upsert SPEED transform (runs before TRIM in the effect)
     setTransforms(prev => {
       const others = prev.filter(t => t.kind !== 'speed')
-      return [...others, { kind: 'speed', startSec: speedStartSecLocal, endSec: speedEndSecLocal, rate: speedMultiplier }]
+      return [...others, { kind: 'speed', startSec: startSecLocal, endSec: endSecLocal, rate: speedMultiplier }]
     })
 
-    setSpeedEdit({ startIdx: speedStartIdxGlobal, endIdx: speedEndIdxGlobal, rate: speedMultiplier })
+    setSpeedEdit({ startIdx, endIdx, rate: speedMultiplier })
     setSubclipSpeedSelection(null)
   }
 
