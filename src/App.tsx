@@ -423,6 +423,38 @@ function App() {
     }
   }
 
+  const handleWordClick = async (e: React.MouseEvent, index: number) => {
+    // Ctrl (Win/Linux) or Cmd (macOS) => seek to audio position
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault()
+      e.stopPropagation()
+
+      const word = captionsData[index]
+      if (!word || !audioRef.current) return
+
+      // Seek to word start time and play if paused
+      audioRef.current.currentTime = word.startMs / 1000
+      if (audioRef.current.paused) {
+        audioRef.current.play().catch(() => {})
+      }
+
+      // Instant visual sync
+      setActiveCaptionIndex(index)
+      const chunkIdx = wordToChunk[index]
+      if (chunkIdx != null) {
+        virtuosoRef.current?.scrollToIndex({
+          index: chunkIdx,
+          align: 'center',
+          behavior: 'auto'
+        })
+      }
+      return
+    }
+
+    // Regular click => handle selection behavior
+    handleCaptionClick(index)
+  }
+
   const handleCaptionClick = async (index: number) => {
     if (!selectionMode) {
       // First click - enter selection mode
@@ -1139,7 +1171,7 @@ function App() {
                         return (
                           <span
                             key={idx}
-                            onClick={() => handleCaptionClick(idx)}
+                            onClick={(e) => handleWordClick(e, idx)}
                             style={{
                               padding: (isActive || isSelected) ? '2px 4px' : 0,
                               backgroundColor: isSelected ? '#90EE90' : (isActive ? '#ffd700' : 'transparent'),
@@ -1223,7 +1255,7 @@ function App() {
                             result.push(
                               <span
                                 key={`${idx}-${partIdx}-${wordIdx}`}
-                                onClick={() => handleCaptionClick(idx)}
+                                onClick={(e) => handleWordClick(e, idx)}
                                 style={{
                                   padding: (isActive || isSelected) ? '2px 4px' : 0,
                                   backgroundColor: part.isMatch
