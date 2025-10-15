@@ -826,7 +826,10 @@ function App() {
                       boxShadow: isActive ? '0 2px 4px rgba(255, 215, 0, 0.3)' : (isSelected ? '0 2px 4px rgba(144, 238, 144, 0.3)' : 'none'),
                       cursor: 'pointer',
                       userSelect: 'none',
-                      border: isSelectionStart ? '2px solid green' : (isSelectionEnd ? '2px solid red' : 'none')
+                      border: isSelectionStart ? '2px solid green' : (isSelectionEnd ? '2px solid red' : 'none'),
+                      textDecoration: 'underline',
+                      textDecorationColor: '#999',
+                      textDecorationThickness: '1px'
                     }}
                   >
                     {caption.text}
