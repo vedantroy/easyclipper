@@ -142,11 +142,7 @@ type Match = { chunkIdx: number; startIdx: number; endIdx: number }
 function App() {
   const [status, setStatus] = useState<string>('Ready to transcribe')
   const [transcription, setTranscription] = useState<string>('')
-  const [useChunking, setUseChunking] = useState(false)
-  const [numChunks, setNumChunks] = useState(4)
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null)
-  const [debugMode, setDebugMode] = useState(false)
-  const [debugChunks, setDebugChunks] = useState(1)
   const [audioUrl, setAudioUrl] = useState<string>('')
   const [currentTime, setCurrentTime] = useState(0)
   const [captionsData, setCaptionsData] = useState<Caption[]>([])
@@ -835,21 +831,6 @@ function App() {
     setQuery({ page: 'edit', hash: fileHash }, 'replace')
   }
 
-  const handleProcessingError = (message: string) => {
-    setStatus(`Error: ${message}`)
-    setProgress(0)
-    setEstimatedTimeRemaining('')
-    setCaptionsData([])
-    setTranscription('')
-    setAudioBuffer(null)
-    setActiveFile(null)
-    if (audioUrl) {
-      URL.revokeObjectURL(audioUrl)
-      setAudioUrl('')
-    }
-    setQuery({ page: 'upload', hash: undefined }, 'replace')
-  }
-
   useEffect(() => {
     if (currentPage !== 'edit' || !currentHash || hasCaptions) {
       return
@@ -893,12 +874,6 @@ function App() {
     }
   }, [currentHash, currentPage, hasCaptions, setQuery])
 
-  useEffect(() => {
-    if (currentPage === 'processing' && !activeFile) {
-      handleProcessingError('Original file unavailable. Please upload again.')
-    }
-  }, [activeFile, currentPage])
-
   if (currentPage === 'upload') {
     return <UploadScreen onFileAccepted={handleFileAccepted} />
   }
@@ -907,18 +882,51 @@ function App() {
   const isClearCacheDisabled = !currentHash
 
   if (currentPage === 'processing') {
-    // todo fix the asserts
+    if (!activeFile || !currentHash) {
+      return (
+        <div
+          style={{
+            padding: '2rem',
+            maxWidth: '800px',
+            margin: '0 auto',
+            color: '#333',
+            backgroundColor: '#fff',
+            minHeight: '100vh',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '1.5rem',
+            justifyContent: 'center'
+          }}
+        >
+          <p style={{ fontSize: '1.1rem' }}>
+            Processing requires the original file. Please return to the upload screen and try again.
+          </p>
+          <button
+            onClick={handleClearCache}
+            style={{
+              padding: '0.75rem 1rem',
+              border: '1px solid #ddd',
+              backgroundColor: '#f5f5f5',
+              color: '#333',
+              borderRadius: '4px',
+              fontWeight: 600,
+              cursor: 'pointer',
+              minWidth: '180px',
+              alignSelf: 'flex-start'
+            }}
+          >
+            Back to upload
+          </button>
+        </div>
+      )
+    }
+
     return (
       <ProcessingScreen
-        file={activeFile!!}
-        fileHash={currentHash!!}
-        useChunking={useChunking}
-        numChunks={numChunks}
-        debugMode={debugMode}
-        debugChunks={debugChunks}
+        file={activeFile}
+        fileHash={currentHash}
         onCancel={handleClearCache}
         onComplete={handleProcessingComplete}
-        // onError={handleProcessingError}
         onAudioBufferReady={setAudioBuffer}
       />
     )
