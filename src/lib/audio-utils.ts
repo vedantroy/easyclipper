@@ -1,6 +1,6 @@
 let audioContext: AudioContext | null = null
 
-const getAudioContext = () => {
+export const getAudioContext = () => {
   if (audioContext) {
     return audioContext
   }

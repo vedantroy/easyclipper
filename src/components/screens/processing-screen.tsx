@@ -8,8 +8,7 @@ type ProcessingScreenProps = {
   file: File
   fileHash: string
   onCancel: () => void
-  onComplete: (fileHash: string, cacheData: CachedTranscript, totalTime: number) => Promise<void> | void
-  onAudioBufferReady?: (buffer: AudioBuffer) => void
+  onComplete: (fileHash: string, cacheData: CachedTranscript, totalTime: number, audioBuffer: AudioBuffer) => Promise<void> | void
 }
 
 type ProcessingConfig = {
@@ -24,7 +23,6 @@ export function ProcessingScreen({
   fileHash,
   onCancel,
   onComplete,
-  onAudioBufferReady,
 }: ProcessingScreenProps) {
   const [useChunking, setUseChunking] = useState(false)
   const [numChunks, setNumChunks] = useState(4)
@@ -64,7 +62,6 @@ export function ProcessingScreen({
     }
     const buffer = await loadAudioBuffer(file)
     audioBufferRef.current = buffer
-    onAudioBufferReady?.(buffer)
     return buffer
   }
 
@@ -215,7 +212,10 @@ export function ProcessingScreen({
 
         const totalTime = (Date.now() - startTimeRef.current) / 1000
         if (!cancelled && !cancelledRef.current) {
-          await onComplete(fileHash, cacheData, totalTime)
+          if (!audioBufferRef.current) {
+            return setErrorMessage(`Internal error: missing audio buffer`)
+          } 
+          await onComplete(fileHash, cacheData, totalTime, audioBufferRef.current!!)
         }
       } catch (error) {
         if (cancelled || cancelledRef.current) return
@@ -235,7 +235,7 @@ export function ProcessingScreen({
       cancelled = true
       cancelledRef.current = true
     }
-  }, [activeConfig, file, fileHash, onAudioBufferReady, onComplete])
+  }, [activeConfig, file, fileHash, onComplete])
 
   const handleStart = () => {
     const sanitizedChunks = Math.max(2, Math.floor(numChunks || 2))

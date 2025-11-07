@@ -8,7 +8,7 @@ import { useQueryParams, StringParam } from 'use-query-params'
 import './App.css'
 import { UploadScreen } from '@/components/screens/upload-screen'
 import { ProcessingScreen } from '@/components/screens/processing-screen'
-import { loadAudioBuffer, trimAudioBuffer, audioBufferToWav } from '@/lib/audio-utils'
+import { loadAudioBuffer, trimAudioBuffer, audioBufferToWav, getAudioContext } from '@/lib/audio-utils'
 import { formatTime } from '@/lib/time'
 import type { Caption, CachedTranscript } from '@/types/transcript'
 
@@ -159,6 +159,7 @@ function App() {
     page: StringParam,
     hash: StringParam
   })
+  console.log('QUERY', query)
   const currentPage = query.page ?? 'upload'
   const currentHash = typeof query.hash === 'string' ? query.hash : null
   useEffect(() => {
@@ -428,7 +429,7 @@ function App() {
     // Sort speed transforms by start time
     const sortedTransforms = [...speedTransforms].sort((a, b) => a.startSec - b.startSec)
 
-    const ctx = initAudioContext()
+    const ctx = getAudioContext()
     const sr = buffer.sampleRate
     const outputChannels: Float32Array[] = []
 
@@ -816,14 +817,16 @@ function App() {
     }
   }
 
-  const handleProcessingComplete = async (fileHash: string, cacheData: CachedTranscript, totalTime: number) => {
+  const handleProcessingComplete = async (fileHash: string, cacheData: CachedTranscript, totalTime: number, audioBuffer: AudioBuffer) => {
     try {
       await localforage.setItem(fileHash, cacheData)
       console.log('Successfully saved to cache with hash:', fileHash)
     } catch (cacheError) {
       console.error('Failed to save to cache:', cacheError)
+      return
     }
 
+    setAudioBuffer(audioBuffer)
     setTranscription(captionsToTranscription(cacheData.captions))
     setCaptionsData(cacheData.captions)
     setProgress(100)
@@ -892,9 +895,8 @@ function App() {
       <ProcessingScreen
         file={activeFile!!}
         fileHash={currentHash!!}
-        onCancel={handleClearCache}
+        onCancel={() => setQuery({ page: 'upload', hash: undefined }, 'replace')}
         onComplete={handleProcessingComplete}
-        onAudioBufferReady={setAudioBuffer}
       />
     )
   }
