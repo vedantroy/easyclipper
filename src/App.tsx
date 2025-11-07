@@ -1,5 +1,4 @@
 import { useState, useRef, useMemo, useEffect } from 'react'
-import { transcribe, canUseWhisperWeb, resampleTo16Khz, downloadWhisperModel, toCaptions } from '@remotion/whisper-web'
 import ReactSlider from 'react-slider'
 import localforage from 'localforage'
 import { Virtuoso  } from 'react-virtuoso'
@@ -8,21 +7,10 @@ import { useQueryParams, StringParam } from 'use-query-params'
 // import { SoundTouch, SimpleFilter } from 'soundtouchjs'
 import './App.css'
 import { UploadScreen } from '@/components/screens/upload-screen'
-
-// Cache storage interface
-interface CachedTranscript {
-  hash: string
-  fileName: string
-  fileSize: number
-  processedAt: string
-  numChunks: number
-  chunkingEnabled: boolean
-  modelUsed: string
-  captions: Array<{text: string, startMs: number, endMs: number, confidence: number | null}>
-}
-
-// Stronger caption type for local use
-type Caption = { text: string; startMs: number; endMs: number; confidence: number | null }
+import { ProcessingScreen } from '@/components/screens/processing-screen'
+import { loadAudioBuffer, trimAudioBuffer, audioBufferToWav } from '@/lib/audio-utils'
+import { formatTime } from '@/lib/time'
+import type { Caption, CachedTranscript } from '@/types/transcript'
 
 // Speed edit type for persistent highlighting
 type SpeedEdit = { id: string; startIdx: number; endIdx: number; rate: number }
@@ -31,21 +19,6 @@ type SpeedEdit = { id: string; startIdx: number; endIdx: number; rate: number }
 type SpeedXform = { kind: 'speed'; startSec: number; endSec: number; rate: number }
 type TrimXform  = { kind: 'trim';  startPct: number; endPct: number }
 type Transform  = SpeedXform | TrimXform
-
-// Format time in seconds to human readable
-function formatTime(seconds: number): string {
-  if (seconds < 60) {
-    return `${Math.round(seconds)}s`
-  } else if (seconds < 3600) {
-    const mins = Math.floor(seconds / 60)
-    const secs = Math.round(seconds % 60)
-    return `${mins}m ${secs}s`
-  } else {
-    const hours = Math.floor(seconds / 3600)
-    const mins = Math.floor((seconds % 3600) / 60)
-    return `${hours}h ${mins}m`
-  }
-}
 
 const formatTimestampMs = (ms: number): string => {
   const hours = Math.floor(ms / 3600000)
@@ -169,10 +142,8 @@ type Match = { chunkIdx: number; startIdx: number; endIdx: number }
 function App() {
   const [status, setStatus] = useState<string>('Ready to transcribe')
   const [transcription, setTranscription] = useState<string>('')
-  const [isProcessing, setIsProcessing] = useState(false)
   const [useChunking, setUseChunking] = useState(false)
   const [numChunks, setNumChunks] = useState(4)
-  const [fileData, setFileData] = useState<{ audioBuffer: AudioBuffer, fileHash: string} | null>(null)
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null)
   const [debugMode, setDebugMode] = useState(false)
   const [debugChunks, setDebugChunks] = useState(1)
@@ -210,6 +181,7 @@ function App() {
   // Detail view subclip modal state
   const [showDetailView, setShowDetailView] = useState(false)
   const hasCaptions = captionsData.length > 0
+  const isActiveProcess = progress > 0 && progress < 100
 
   // Prevent body scroll when modal is open
   useEffect(() => {
@@ -229,12 +201,9 @@ function App() {
   const [speedEdits, setSpeedEdits] = useState<SpeedEdit[]>([])
   const [transforms, setTransforms] = useState<Transform[]>([])
 
-  const audioContextRef = useRef<AudioContext | null>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
   const subclipAudioRef = useRef<HTMLAudioElement>(null)
-  const startTimeRef = useRef<number>(0)
   const virtuosoRef = useRef<VirtuosoHandle>(null)
-  const processingRunRef = useRef(false)
 
   // Helper to check if a word index is in any speed edit range
   const isIdxInSpeedEdit = (idx: number) => {
@@ -408,63 +377,6 @@ function App() {
     render()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioBuffer, selectedRange, transforms])
-
-  // Simple, phase-aware progress + ETA (no 10/90 guessing)
-  const NUM_PHASES = 2 // 0: resample, 1: transcribe
-  const updateOverall = (chunkIndex: number, phaseIndex: number, phaseProgress: number, chunksTotal: number) => {
-    const completedUnits = (chunkIndex * NUM_PHASES) + phaseIndex + Math.max(0, Math.min(1, phaseProgress))
-    const totalUnits = chunksTotal * NUM_PHASES
-    const overall = (completedUnits / totalUnits) * 100
-    const clamped = Math.max(0, Math.min(100, overall))
-    setProgress(clamped)
-    // ETA after 1% to avoid wild swings
-    if (clamped >= 1) {
-      const elapsed = (Date.now() - startTimeRef.current) / 1000
-      const frac = clamped / 100
-      if (frac > 0) {
-        const remaining = elapsed * (1 - frac) / frac
-        setEstimatedTimeRemaining(formatTime(remaining))
-      }
-    }
-  }
-
-  const initAudioContext = () => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)()
-    }
-    return audioContextRef.current
-  }
-
-  const loadAudioBuffer = async (file: File): Promise<AudioBuffer> => {
-    const audioContext = initAudioContext()
-    const arrayBuffer = await file.arrayBuffer()
-    return await audioContext.decodeAudioData(arrayBuffer)
-  }
-
-  const trimAudioBuffer = (buffer: AudioBuffer, startTime: number, endTime: number): AudioBuffer => {
-    const audioContext = initAudioContext()
-    const sampleRate = buffer.sampleRate
-    const startSample = Math.floor(startTime * sampleRate)
-    const endSample = Math.floor(endTime * sampleRate)
-    const duration = endSample - startSample
-
-    const trimmedBuffer = audioContext.createBuffer(
-      buffer.numberOfChannels,
-      duration,
-      sampleRate
-    )
-
-    for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
-      const sourceData = buffer.getChannelData(channel)
-      const trimmedData = trimmedBuffer.getChannelData(channel)
-      
-      for (let i = 0; i < duration; i++) {
-        trimmedData[i] = sourceData[startSample + i]
-      }
-    }
-
-    return trimmedBuffer
-  }
 
   // 3) rewrite the resampler (fix rounding & edge handling)
   // const applySpeedSegment = (buffer: AudioBuffer, xf: SpeedXform): AudioBuffer => {
@@ -690,58 +602,6 @@ function App() {
     return offset + currentTime
   }
 
-  const audioBufferToWav = async (buffer: AudioBuffer): Promise<Blob> => {
-    const numberOfChannels = buffer.numberOfChannels
-    const sampleRate = buffer.sampleRate
-    const format = 1 // PCM
-    const bitDepth = 16
-    
-    const bytesPerSample = bitDepth / 8
-    const blockAlign = numberOfChannels * bytesPerSample
-    
-    const data = []
-    for (let channel = 0; channel < numberOfChannels; channel++) {
-      data.push(buffer.getChannelData(channel))
-    }
-    
-    const length = data[0].length
-    const arrayBuffer = new ArrayBuffer(44 + length * numberOfChannels * bytesPerSample)
-    const view = new DataView(arrayBuffer)
-    
-    // WAV header
-    const writeString = (offset: number, string: string) => {
-      for (let i = 0; i < string.length; i++) {
-        view.setUint8(offset + i, string.charCodeAt(i))
-      }
-    }
-    
-    writeString(0, 'RIFF')
-    view.setUint32(4, 36 + length * numberOfChannels * bytesPerSample, true)
-    writeString(8, 'WAVE')
-    writeString(12, 'fmt ')
-    view.setUint32(16, 16, true)
-    view.setUint16(20, format, true)
-    view.setUint16(22, numberOfChannels, true)
-    view.setUint32(24, sampleRate, true)
-    view.setUint32(28, sampleRate * blockAlign, true)
-    view.setUint16(32, blockAlign, true)
-    view.setUint16(34, bitDepth, true)
-    writeString(36, 'data')
-    view.setUint32(40, length * numberOfChannels * bytesPerSample, true)
-    
-    // Write audio data
-    let offset = 44
-    for (let i = 0; i < length; i++) {
-      for (let channel = 0; channel < numberOfChannels; channel++) {
-        const sample = Math.max(-1, Math.min(1, data[channel][i]))
-        view.setInt16(offset, sample * 0x7FFF, true)
-        offset += 2
-      }
-    }
-    
-    return new Blob([arrayBuffer], { type: 'audio/wav' })
-  }
-
   const handleTimeUpdate = () => {
     if (!audioRef.current) return
 
@@ -874,233 +734,52 @@ function App() {
     setSubclipSpeedSelection(null)
   }
 
-  const chunkAudioFile = async (file: File, numChunks: number): Promise<File[]> => {
-    let buffer = audioBuffer
-    if (!buffer) {
-      setStatus('Loading audio buffer...')
-      buffer = await loadAudioBuffer(file)
-      setAudioBuffer(buffer)
+  const handleFileAccepted = async (file: File, fileHash: string) => {
+    if (audioUrl) {
+      URL.revokeObjectURL(audioUrl)
     }
-    
-    const totalDuration = buffer.length / buffer.sampleRate
-    const chunkDuration = totalDuration / numChunks
-    const chunks: File[] = []
-    
-    for (let i = 0; i < numChunks; i++) {
-      const startTime = i * chunkDuration
-      const endTime = Math.min((i + 1) * chunkDuration, totalDuration)
-      
-      const trimmedBuffer = trimAudioBuffer(buffer, startTime, endTime)
-      const wavBlob = await audioBufferToWav(trimmedBuffer)
-      const chunkFile = new File([wavBlob], `chunk_${i}.wav`, { type: 'audio/wav' })
-      chunks.push(chunkFile)
-    }
-    
-    return chunks
-  }
 
-  const processFile = async (file: File, fileHash: string) => {
     setActiveFile(file)
-    setIsProcessing(true)
-    setTranscription('')
     setCaptionsData([])
-    setActiveCaptionIndex(-1)
+    setTranscription('')
     setProgress(0)
-    startTimeRef.current = Date.now()
     setEstimatedTimeRemaining('')
+    setAudioBuffer(null)
 
-    if (!audioUrl) {
-      const url = URL.createObjectURL(file)
-      setAudioUrl(url)
-    }
-
-    console.log('File info:', {
-      name: file.name,
-      size: file.size,
-      type: file.type,
-      duration: 'unknown', // Will be calculated during processing
-      sizeInMB: (file.size / 1024 / 1024).toFixed(2) + ' MB'
-    })
+    const objectUrl = URL.createObjectURL(file)
+    setAudioUrl(objectUrl)
+    setCurrentTime(0)
 
     try {
-      console.log('Generated file hash:', fileHash)
-      setStatus('Preparing transcription...')
+      const cached = await localforage.getItem<CachedTranscript>(fileHash)
+      if (cached) {
+        setCaptionsData(cached.captions)
+        setTranscription(captionsToTranscription(cached.captions))
+        setProgress(100)
+        setStatus('Loaded cached transcript!')
+        setQuery({ page: 'edit', hash: fileHash }, 'replace')
 
-      const modelToUse = 'tiny.en'
-      
-      setStatus('Checking browser compatibility...')
-      const { supported, detailedReason } = await canUseWhisperWeb(modelToUse)
-      if (!supported) {
-        throw new Error(`Whisper Web is not supported in this environment: ${detailedReason}`)
-      }
-
-      setStatus('Downloading model...')
-      await downloadWhisperModel({
-        model: modelToUse,
-        onProgress: ({ progress }) => setStatus(`Downloading model (${Math.round(progress * 100)}%)...`),
-      })
-
-      let filesToTranscribe: File[] = [file]
-      let loadedBuffer: AudioBuffer | null = null
-      
-      if (useChunking) {
-        setStatus('Chunking audio using Web Audio API...')
-        // Load the buffer and store it locally
-        loadedBuffer = await loadAudioBuffer(file)
-        setAudioBuffer(loadedBuffer)
-        
-        // Now use the local buffer for chunking
-        const totalDuration = loadedBuffer.length / loadedBuffer.sampleRate
-        const chunkDuration = totalDuration / numChunks
-        const chunks: File[] = []
-        
-        for (let i = 0; i < numChunks; i++) {
-          const startTime = i * chunkDuration
-          const endTime = Math.min((i + 1) * chunkDuration, totalDuration)
-          
-          const trimmedBuffer = trimAudioBuffer(loadedBuffer, startTime, endTime)
-          const wavBlob = await audioBufferToWav(trimmedBuffer)
-          const chunkFile = new File([wavBlob], `chunk_${i}.wav`, { type: 'audio/wav' })
-          chunks.push(chunkFile)
+        try {
+          const buffer = await loadAudioBuffer(file)
+          setAudioBuffer(buffer)
+        } catch (bufferError) {
+          console.warn('Failed to load audio buffer for cached file:', bufferError)
         }
-        
-        filesToTranscribe = chunks
-        console.log(`Created ${filesToTranscribe.length} chunks`)
+
+        return
       }
 
-      const allTranscriptions: string[] = []
-      const allCaptions: Caption[] = []
-
-      // In debug mode with chunking, only process the specified number of chunks
-      const chunksToProcess = (debugMode && useChunking) ? Math.min(debugChunks, filesToTranscribe.length) : filesToTranscribe.length
-
-      for (let i = 0; i < chunksToProcess; i++) {
-        const currentFile = filesToTranscribe[i]
-        const chunkLabel = useChunking ? ` (chunk ${i + 1}/${chunksToProcess})` : ''
-
-        setStatus(`Resampling audio${chunkLabel}...`)
-        console.log(`Starting resample step${chunkLabel}`)
-        const channelWaveform = await resampleTo16Khz({
-          file: currentFile,
-          onProgress: (p) => {
-            updateOverall(i, 0, p, chunksToProcess)
-            setStatus(`Resampling audio${chunkLabel} (${Math.round(p * 100)}%)...`)
-          },
-        })
-        console.log(`Resample complete${chunkLabel}, channelWaveform length:`, channelWaveform.length)
-
-        setStatus(`Transcribing${chunkLabel}...`)
-        console.log(`Starting transcribe step${chunkLabel}`)
-        const whisperWebOutput = await transcribe({
-          channelWaveform,
-          model: modelToUse,
-          onProgress: (p) => {
-            updateOverall(i, 1, p, chunksToProcess)
-            setStatus(`Transcribing${chunkLabel} (${Math.round(p * 100)}%)...`)
-          },
-        })
-        console.log(`Transcribe complete${chunkLabel}`)
-
-        // Convert to captions format
-        const { captions } = toCaptions({
-          whisperWebOutput,
-        })
-        console.log('Captions:', captions)
-
-        if (useChunking && loadedBuffer) {
-          const chunkStartTime = i * (loadedBuffer.length / loadedBuffer.sampleRate / numChunks)
-          const chunkStartTimeMs = chunkStartTime * 1000
-          const absoluteChunkCaptions: Caption[] = []
-
-          captions.forEach(caption => {
-            if (caption.startMs !== caption.endMs) {
-              const adjustedCaption: Caption = {
-                text: caption.text,
-                startMs: caption.startMs + chunkStartTimeMs,
-                endMs: caption.endMs + chunkStartTimeMs,
-                confidence: caption.confidence
-              }
-              allCaptions.push(adjustedCaption)
-              absoluteChunkCaptions.push(adjustedCaption)
-            }
-          })
-
-          if (absoluteChunkCaptions.length) {
-            const chunkTranscriptionWithTimestamps = captionsToTranscription(absoluteChunkCaptions)
-            allTranscriptions.push(chunkTranscriptionWithTimestamps)
-          }
-        } else {
-          const normalizedCaptions: Caption[] = []
-          captions.forEach(caption => {
-            if (caption.startMs !== caption.endMs) {
-              const normalizedCaption: Caption = {
-                text: caption.text,
-                startMs: caption.startMs,
-                endMs: caption.endMs,
-                confidence: caption.confidence
-              }
-              allCaptions.push(normalizedCaption)
-              normalizedCaptions.push(normalizedCaption)
-            }
-          })
-
-          if (normalizedCaptions.length) {
-            const transcriptionWithTimestamps = captionsToTranscription(normalizedCaptions)
-            allTranscriptions.push(transcriptionWithTimestamps)
-          }
-        }
-      }
-
-      const finalTranscription = allTranscriptions.join('\n\n')
-      setTranscription(finalTranscription)
-      setCaptionsData(allCaptions)
-
-      // Save to cache
-      setStatus('Saving to cache...')
-      console.log('Preparing to save to cache, captions count:', allCaptions.length)
-
-      const cacheData: CachedTranscript = {
-        hash: fileHash,
-        fileName: file.name,
-        fileSize: file.size,
-        processedAt: new Date().toLocaleString(),
-        numChunks: useChunking ? numChunks : 1,
-        chunkingEnabled: useChunking,
-        modelUsed: modelToUse,
-        captions: allCaptions
-      }
-
-      console.log('Cache data prepared:', {
-        hash: fileHash,
-        fileName: file.name,
-        fileSize: file.size,
-        captionsCount: allCaptions.length,
-        dataSize: JSON.stringify(cacheData).length + ' characters'
-      })
-
-      const totalTime = (Date.now() - startTimeRef.current) / 1000
-      await handleProcessingComplete(fileHash, cacheData, totalTime)
-
+      setStatus('Preparing processing pipeline...')
+      setQuery({ page: 'processing', hash: fileHash }, 'replace')
     } catch (error) {
-      console.error('Error transcribing:', error)
-      setStatus(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      console.error('Error preparing file for processing:', error)
+      setStatus(`Error: ${message}`)
       setQuery({ page: 'upload', hash: undefined }, 'replace')
-      setIsProcessing(false)
     }
-  }
-
-  const handleFileAccepted = async (file: File, fileHash: string) => {
-    const isCached = !!(await localforage.getItem<CachedTranscript>(fileHash))
-    setFileData({
-      audioBuffer: await loadAudioBuffer(file),
-      fileHash
-    })
-    console.log('set q')
-    setQuery({ page: isCached ? 'edit' : 'processing'}, 'replace')
   }
 
   const resetEditorState = () => {
-    setIsProcessing(false)
     setStatus('Ready to transcribe')
     setTranscription('')
     setCaptionsData([])
@@ -1153,18 +832,31 @@ function App() {
     setCaptionsData(cacheData.captions)
     setProgress(100)
     setStatus(`Transcription complete! (Total time: ${formatTime(totalTime)})`)
-    setIsProcessing(false)
     setQuery({ page: 'edit', hash: fileHash }, 'replace')
   }
 
+  const handleProcessingError = (message: string) => {
+    setStatus(`Error: ${message}`)
+    setProgress(0)
+    setEstimatedTimeRemaining('')
+    setCaptionsData([])
+    setTranscription('')
+    setAudioBuffer(null)
+    setActiveFile(null)
+    if (audioUrl) {
+      URL.revokeObjectURL(audioUrl)
+      setAudioUrl('')
+    }
+    setQuery({ page: 'upload', hash: undefined }, 'replace')
+  }
+
   useEffect(() => {
-    if (currentPage !== 'edit' || !currentHash || isProcessing || hasCaptions) {
+    if (currentPage !== 'edit' || !currentHash || hasCaptions) {
       return
     }
 
     let cancelled = false
     setStatus('Loading cached transcript...')
-    setIsProcessing(false)
     setAudioUrl('')
     setAudioBuffer(null)
 
@@ -1199,116 +891,36 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [currentHash, currentPage, hasCaptions, isProcessing, setQuery])
-
-  // useEffect(() => {
-  //   if (currentPage === 'processing' && !activeFile) {
-  //     setStatus('Original file unavailable. Please upload again.')
-  //     setQuery({ page: 'upload', hash: undefined }, 'replace')
-  //   }
-  // }, [activeFile, currentPage, setQuery])
+  }, [currentHash, currentPage, hasCaptions, setQuery])
 
   useEffect(() => {
-    if (currentPage === 'processing' && activeFile && currentHash) {
-      if (processingRunRef.current) {
-        return
-      }
-      processingRunRef.current = true
-
-      void processFile(activeFile, currentHash).catch(error => {
-        console.error('Processing failed:', error)
-        setStatus(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
-        setQuery({ page: 'upload', hash: undefined }, 'replace')
-        setIsProcessing(false)
-        processingRunRef.current = false
-      })
-    } else if (currentPage !== 'processing') {
-      processingRunRef.current = false
+    if (currentPage === 'processing' && !activeFile) {
+      handleProcessingError('Original file unavailable. Please upload again.')
     }
-  }, [activeFile, currentHash, currentPage])
+  }, [activeFile, currentPage])
 
   if (currentPage === 'upload') {
     return <UploadScreen onFileAccepted={handleFileAccepted} />
   }
 
-  if (currentPage === 'processing') {
-    return <div>hi</div>
-  }
 
   const isClearCacheDisabled = !currentHash
 
-  if (currentPage === 'processing' && !hasCaptions) {
+  if (currentPage === 'processing') {
+    // todo fix the asserts
     return (
-      <div style={{
-        padding: '2rem',
-        maxWidth: '800px',
-        margin: '0 auto',
-        color: '#333',
-        backgroundColor: '#fff',
-        minHeight: '100vh',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '1.5rem',
-        justifyContent: 'center'
-      }}>
-        <div style={{
-          padding: '1rem',
-          backgroundColor: '#fff3cd',
-          border: '1px solid #ffeaa7',
-          borderRadius: '4px'
-        }}>
-          <strong>Status:</strong> {status}
-          {progress > 0 && (
-            <div style={{ marginTop: '1rem' }}>
-              <div style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                marginBottom: '0.5rem',
-                fontSize: '0.9em',
-                color: '#666'
-              }}>
-                <span>Progress: {Math.round(progress)}%</span>
-                {estimatedTimeRemaining && (
-                  <span>Est. remaining: {estimatedTimeRemaining}</span>
-                )}
-              </div>
-              <div style={{
-                width: '100%',
-                height: '20px',
-                backgroundColor: '#e9ecef',
-                borderRadius: '10px',
-                overflow: 'hidden'
-              }}>
-                <div style={{
-                  width: `${progress}%`,
-                  height: '100%',
-                  backgroundColor: '#4caf50',
-                  transition: 'width 0.3s ease',
-                  borderRadius: '10px'
-                }} />
-              </div>
-            </div>
-          )}
-        </div>
-
-        <button
-          onClick={handleClearCache}
-          disabled={isClearCacheDisabled}
-          style={{
-            padding: '0.75rem 1rem',
-            border: `1px solid ${isClearCacheDisabled ? '#ddd' : '#f5c2c7'}`,
-            backgroundColor: isClearCacheDisabled ? '#f5f5f5' : '#f8d7da',
-            color: isClearCacheDisabled ? '#888' : '#842029',
-            borderRadius: '4px',
-            fontWeight: 600,
-            cursor: isClearCacheDisabled ? 'not-allowed' : 'pointer',
-            minWidth: '180px',
-            alignSelf: 'flex-start'
-          }}
-        >
-          Cancel & restart
-        </button>
-      </div>
+      <ProcessingScreen
+        file={activeFile!!}
+        fileHash={currentHash!!}
+        useChunking={useChunking}
+        numChunks={numChunks}
+        debugMode={debugMode}
+        debugChunks={debugChunks}
+        onCancel={handleClearCache}
+        onComplete={handleProcessingComplete}
+        // onError={handleProcessingError}
+        onAudioBufferReady={setAudioBuffer}
+      />
     )
   }
 
@@ -1334,15 +946,15 @@ function App() {
           <div style={{ flex: '1 1 300px' }}>
             <div style={{
               padding: '1rem',
-              backgroundColor: isProcessing ? '#fff3cd' : '#d4edda',
-              border: `1px solid ${isProcessing ? '#ffeaa7' : '#c3e6cb'}`,
+              backgroundColor: isActiveProcess ? '#fff3cd' : '#d4edda',
+              border: `1px solid ${isActiveProcess ? '#ffeaa7' : '#c3e6cb'}`,
               borderRadius: '4px',
               color: '#333',
               height: '100%'
             }}>
               <strong>Status:</strong> {status}
 
-              {isProcessing && progress > 0 && (
+              {isActiveProcess && (
                 <div style={{ marginTop: '1rem' }}>
                   <div style={{
                     display: 'flex',
