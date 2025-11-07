@@ -874,57 +874,24 @@ function App() {
     }
   }, [currentHash, currentPage, hasCaptions, setQuery])
 
-  if (currentPage === 'upload') {
-    return <UploadScreen onFileAccepted={handleFileAccepted} />
+  const invalidProcessingPage = currentPage === 'processing' && (!activeFile || !currentHash);
+  useEffect(() => {
+    if (invalidProcessingPage) {
+      setQuery({ page: 'upload', hash: undefined}, 'replace')
+    }
+  }, [invalidProcessingPage])
+
+  if (invalidProcessingPage) {
+    return <div>bug</div>
   }
 
-
-  const isClearCacheDisabled = !currentHash
-
-  if (currentPage === 'processing') {
-    if (!activeFile || !currentHash) {
-      return (
-        <div
-          style={{
-            padding: '2rem',
-            maxWidth: '800px',
-            margin: '0 auto',
-            color: '#333',
-            backgroundColor: '#fff',
-            minHeight: '100vh',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '1.5rem',
-            justifyContent: 'center'
-          }}
-        >
-          <p style={{ fontSize: '1.1rem' }}>
-            Processing requires the original file. Please return to the upload screen and try again.
-          </p>
-          <button
-            onClick={handleClearCache}
-            style={{
-              padding: '0.75rem 1rem',
-              border: '1px solid #ddd',
-              backgroundColor: '#f5f5f5',
-              color: '#333',
-              borderRadius: '4px',
-              fontWeight: 600,
-              cursor: 'pointer',
-              minWidth: '180px',
-              alignSelf: 'flex-start'
-            }}
-          >
-            Back to upload
-          </button>
-        </div>
-      )
-    }
-
+  if (currentPage === 'upload') {
+    return <UploadScreen onFileAccepted={handleFileAccepted} />
+  } else if (currentPage === 'processing') {
     return (
       <ProcessingScreen
-        file={activeFile}
-        fileHash={currentHash}
+        file={activeFile!!}
+        fileHash={currentHash!!}
         onCancel={handleClearCache}
         onComplete={handleProcessingComplete}
         onAudioBufferReady={setAudioBuffer}
@@ -932,6 +899,7 @@ function App() {
     )
   }
 
+  const isClearCacheDisabled = !currentHash
   return (
     <>
       <div style={{
